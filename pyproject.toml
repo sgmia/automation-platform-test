@@ -1,0 +1,49 @@
+[project]
+name = "entra-static-server"
+version = "0.1.0"
+description = "Static web server with Microsoft Entra ID (OIDC) authentication"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.115",
+    "httpx2>=2.12",
+    "pydantic-settings>=2.7",
+    "pyjwt[crypto]>=2.10",
+]
+
+[project.scripts]
+entra-static-server = "entra_server.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/entra_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"  # plain `async def test_...` functions, no marker needed
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RUF",
+]

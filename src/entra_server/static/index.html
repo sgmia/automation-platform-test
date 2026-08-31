@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP Request Sender</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f26;
+    --border: #2e333d;
+    --text: #e6e8ec;
+    --muted: #9aa1ad;
+    --accent: #5b8cff;
+    --ok: #4ec27f;
+    --err: #ef6a6a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  input, select, textarea, button {
+    font-family: inherit;
+    font-size: 14px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  textarea { width: 100%; min-height: 110px; resize: vertical; font-family: var(--mono); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row + .row { margin-top: 8px; }
+  .url-bar { display: grid; grid-template-columns: 130px 1fr auto; gap: 8px; }
+  .kv { display: grid; grid-template-columns: 1fr 1.6fr auto; gap: 8px; }
+  .kv input { width: 100%; font-family: var(--mono); }
+  button {
+    cursor: pointer;
+    background: #262b34;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #0b0d11; font-weight: 600; }
+  button.icon { padding: 8px 12px; color: var(--muted); }
+  button:disabled { opacity: .55; cursor: default; }
+  .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; font-family: var(--mono); font-size: 13px; }
+  .status-ok { color: var(--ok); }
+  .status-err { color: var(--err); }
+  pre {
+    margin: 0;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 13px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 420px;
+    overflow: auto;
+  }
+  pre + label { margin-top: 12px; }
+  .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  .preview {
+    margin: 12px 0 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .preview b { color: var(--text); font-weight: 400; }
+  label.check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 0 0;
+    font-size: 13px;
+    color: var(--text);
+    cursor: pointer;
+  }
+  label.check input { margin: 0; accent-color: var(--accent); }
+  label.check .note { margin: 0; }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>HTTP Request Sender</h1>
+  <p class="sub">Send a request to any URL with custom headers and inspect the response.</p>
+
+  <form id="form">
+    <section>
+      <label for="url">Request</label>
+      <div class="url-bar">
+        <select id="method" aria-label="HTTP method">
+          <option>GET</option>
+          <option>POST</option>
+          <option>PUT</option>
+          <option>PATCH</option>
+          <option>DELETE</option>
+          <option>HEAD</option>
+          <option>OPTIONS</option>
+        </select>
+        <input id="url" type="text" placeholder="https://api.example.com/things" required
+               autocomplete="off" spellcheck="false">
+        <button type="submit" class="primary" id="send">Send</button>
+      </div>
+      <label class="check">
+        <input type="checkbox" id="replace-page">
+        Replace this page with the response
+        <span class="note">— renders the response body as the whole document; reload to come back</span>
+      </label>
+      <p class="preview hide" id="auth-note"></p>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>URL parameters</h2>
+        <div class="row">
+          <button type="button" id="extract-params" title="Move the query string from the URL field into rows below">Extract from URL</button>
+          <button type="button" id="add-param">+ Add parameter</button>
+        </div>
+      </div>
+      <div id="params"></div>
+      <p class="preview">Request URL: <b id="url-preview">—</b></p>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Headers</h2>
+        <button type="button" id="add-header">+ Add header</button>
+      </div>
+      <div id="headers"></div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Body</h2>
+        <span class="note" id="body-note"></span>
+      </div>
+      <textarea id="body" placeholder='{ "key": "value" }' spellcheck="false"></textarea>
+    </section>
+  </form>
+
+  <section id="result" class="hide">
+    <div class="head"><h2>Response</h2></div>
+    <div class="meta" id="result-meta"></div>
+    <div id="result-headers-wrap">
+      <label>Response headers</label>
+      <pre id="result-headers"></pre>
+    </div>
+    <label>Body</label>
+    <pre id="result-body"></pre>
+    <p class="note">
+      Requests are made from the browser, so they are subject to CORS. If the target server does not
+      send <code>Access-Control-Allow-Origin</code>, the request fails and only a limited set of
+      response headers is visible.
+    </p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const headersEl = $('headers');
+const paramsEl = $('params');
+
+function addRow(container, placeholder, name = '', value = '') {
+  const row = document.createElement('div');
+  row.className = 'kv row';
+  row.innerHTML = `
+    <input type="text" autocomplete="off" spellcheck="false">
+    <input type="text" placeholder="Value" autocomplete="off" spellcheck="false">
+    <button type="button" class="icon" title="Remove">&times;</button>`;
+  const [nameInput, valueInput] = row.querySelectorAll('input');
+  nameInput.placeholder = placeholder;
+  nameInput.value = name;
+  valueInput.value = value;
+  row.querySelector('button').addEventListener('click', () => {
+    row.remove();
+    if (!container.children.length) addRow(container, placeholder);
+    updatePreview();
+    scheduleSave();  // removing a row fires no input event
+  });
+  container.appendChild(row);
+  return row;
+}
+
+const addHeaderRow = (name, value) => addRow(headersEl, 'Header name', name, value);
+const addParamRow = (name, value) => addRow(paramsEl, 'Parameter name', name, value);
+
+// Returns [name, value] for every row with a non-empty name. Parameters may legitimately
+// repeat (?tag=a&tag=b), so callers get pairs rather than an object.
+function collectPairs(container) {
+  return [...container.children].flatMap((row) => {
+    const [nameInput, valueInput] = row.querySelectorAll('input');
+    const name = nameInput.value.trim();
+    return name ? [[name, valueInput.value.trim()]] : [];
+  });
+}
+
+function collectHeaders() {
+  return Object.fromEntries(collectPairs(headersEl));
+}
+
+// ---------------------------------------------------------------------------
+// Backend access token
+//
+// The client credentials flow runs on the server, so the client secret never
+// reaches the browser -- this only fetches the resulting access token. It is
+// attached exclusively to requests aimed at the configured backend, never to
+// whatever URL happens to be in the form.
+// ---------------------------------------------------------------------------
+const backend = { token: null, url: '', expiresAt: 0, disabled: false, error: '' };
+let backendInFlight = null;
+
+async function fetchBackendToken() {
+  const response = await fetch('/oauth2/backend-token', { headers: { Accept: 'application/json' } });
+  if (response.status === 404) {  // no backend configured on this server
+    backend.disabled = true;
+    return null;
+  }
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+
+  const data = await response.json();
+  backend.token = data.access_token;
+  backend.url = data.backend_url;
+  // The server renews well before the real expiry; drop our copy a little sooner still.
+  backend.expiresAt = performance.now() + Math.max(1, data.expires_in - 30) * 1000;
+  backend.error = '';
+  return backend;
+}
+
+// Cached until it is nearly stale, and de-duplicated so that typing in the URL
+// field cannot start a fetch per keystroke.
+function backendToken() {
+  if (backend.disabled) return Promise.resolve(null);
+  if (backend.token && performance.now() < backend.expiresAt) return Promise.resolve(backend);
+  if (!backendInFlight) {
+    backendInFlight = fetchBackendToken()
+      .catch((error) => {
+        backend.token = null;
+        backend.error = String(error);
+        return null;
+      })
+      .finally(() => { backendInFlight = null; });
+  }
+  return backendInFlight;
+}
+
+// True only for URLs at or below the backend prefix, so a token is never sent
+// to another origin -- or to a lookalike path like /apiXX next to /api.
+function targetsBackend(requestUrl) {
+  if (!backend.url) return false;
+  let target, base;
+  try {
+    target = new URL(requestUrl, document.baseURI);
+    base = new URL(backend.url);
+  } catch {
+    return false;
+  }
+  if (target.origin !== base.origin) return false;
+  const prefix = base.pathname.endsWith('/') ? base.pathname : base.pathname + '/';
+  return (target.pathname + '/').startsWith(prefix);
+}
+
+const hasHeader = (headers, name) =>
+  Object.keys(headers).some((key) => key.toLowerCase() === name);
+
+async function updateAuthNote() {
+  const note = $('auth-note');
+  const token = await backendToken();
+  const matches = targetsBackend(buildUrl());
+
+  let text = '';
+  if (backend.error && matches) {
+    text = `Backend token unavailable (${backend.error}). Reload if your sign-in has expired.`;
+  } else if (token && matches) {
+    text = 'Authorization: Bearer … will be added for the backend.';
+  } else if (token) {
+    text = `A backend token is available, but it is only sent to ${backend.url}`;
+  }
+
+  note.textContent = text;
+  note.classList.toggle('hide', !text);
+}
+
+// Appends the parameter rows to whatever query string the URL field already has.
+// Falls back to plain string building when the URL is relative or not yet parseable.
+function buildUrl() {
+  const raw = $('url').value.trim();
+  const pairs = collectPairs(paramsEl);
+  if (!raw || !pairs.length) return raw;
+
+  try {
+    const url = new URL(raw, document.baseURI);
+    for (const [name, value] of pairs) url.searchParams.append(name, value);
+    return url.toString();
+  } catch {
+    const query = pairs
+      .map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`)
+      .join('&');
+    return raw + (raw.includes('?') ? '&' : '?') + query;
+  }
+}
+
+function updatePreview() {
+  $('url-preview').textContent = buildUrl() || '—';
+  updateAuthNote();
+}
+
+// Pulls an existing ?a=1&b=2 off the URL field and turns it into editable rows.
+function extractParams() {
+  const raw = $('url').value.trim();
+  const start = raw.indexOf('?');
+  if (start === -1) return;
+
+  const existing = new URLSearchParams(raw.slice(start + 1));
+  if (![...existing].length) return;
+
+  if (collectPairs(paramsEl).length === 0) paramsEl.replaceChildren();
+  for (const [name, value] of existing) addParamRow(name, value);
+  $('url').value = raw.slice(0, start);
+  updatePreview();
+  scheduleSave();
+}
+
+function prettify(text, contentType = '') {
+  if (/json/i.test(contentType)) {
+    try { return JSON.stringify(JSON.parse(text), null, 2); } catch { /* fall through */ }
+  }
+  return text;
+}
+
+// ---------------------------------------------------------------------------
+// Saved form state
+//
+// Kept in a cookie so the form comes back on an ordinary reload as well as after the document
+// rewrite that "Replace this page" performs. A cookie rides along on every request to this
+// origin, so the payload is capped well under the ~4 KB browsers accept and the body -- the only
+// field with no natural length limit -- is the first thing dropped when it does not fit.
+// ---------------------------------------------------------------------------
+const STATE_KEY = 'http-request-sender-state';
+const STATE_MAX_AGE = 60 * 60 * 24 * 30;
+const STATE_LIMIT = 3500;
+
+function writeStateCookie(value) {
+  const secure = location.protocol === 'https:' ? '; Secure' : '';
+  document.cookie = `${STATE_KEY}=${value}; Path=/; Max-Age=${STATE_MAX_AGE}; SameSite=Lax${secure}`;
+}
+
+function readStateCookie() {
+  const prefix = STATE_KEY + '=';
+  const entry = document.cookie.split('; ').find((part) => part.startsWith(prefix));
+  return entry ? entry.slice(prefix.length) : '';
+}
+
+function saveState() {
+  clearTimeout(saveTimer);  // a pending save would run after "Replace this page" removed the form
+  const state = {
+    method: $('method').value,
+    url: $('url').value,
+    body: $('body').value,
+    replacePage: $('replace-page').checked,
+    params: collectPairs(paramsEl),
+    headers: collectPairs(headersEl),
+  };
+
+  let encoded = encodeURIComponent(JSON.stringify(state));
+  if (encoded.length > STATE_LIMIT) encoded = encodeURIComponent(JSON.stringify({ ...state, body: '' }));
+  if (encoded.length > STATE_LIMIT) return;  // still too big: keep whatever was saved last
+  writeStateCookie(encoded);
+}
+
+// Typing writes a cookie that every subsequent request then carries, so coalesce the keystrokes.
+let saveTimer = 0;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveState, 250);
+}
+
+// The cookie is user-editable and may predate a change to the shape above, so nothing here trusts
+// it further than "an array of pairs of strings".
+function restoreRows(addRowFor, pairs) {
+  if (!Array.isArray(pairs)) return;
+  for (const pair of pairs) {
+    if (Array.isArray(pair)) addRowFor(String(pair[0] ?? ''), String(pair[1] ?? ''));
+  }
+}
+
+function restoreState() {
+  let state = null;
+  try { state = JSON.parse(decodeURIComponent(readStateCookie())); } catch { /* absent or malformed */ }
+  if (!state || typeof state !== 'object') return false;
+
+  const method = $('method');
+  method.value = String(state.method ?? '');
+  if (!method.value) method.value = 'GET';  // an unknown method would leave the select blank
+  $('url').value = String(state.url ?? '');
+  $('body').value = String(state.body ?? '');
+  $('replace-page').checked = Boolean(state.replacePage);
+
+  paramsEl.replaceChildren();
+  headersEl.replaceChildren();
+  restoreRows(addParamRow, state.params);
+  restoreRows(addHeaderRow, state.headers);
+  if (!paramsEl.children.length) addParamRow();
+  if (!headersEl.children.length) addHeaderRow();
+  return true;
+}
+
+// Replaces the entire document with the response. HTML is rendered as HTML — note that any
+// scripts it contains then run with this page's origin — anything else is shown as text.
+function replacePageWith(text, url, contentType) {
+  saveState();
+
+  const bar =
+    '<div style="position:sticky;top:0;display:flex;gap:12px;align-items:center;' +
+    'padding:8px 12px;background:#1c1f26;color:#e6e8ec;border-bottom:1px solid #2e333d;' +
+    'font:13px system-ui,sans-serif;z-index:2147483647">' +
+    '<button id="__back" style="cursor:pointer;font:inherit;color:#0b0d11;background:#5b8cff;' +
+    'border:0;border-radius:6px;padding:6px 10px">&larr; Back to request</button>' +
+    `<span style="font-family:ui-monospace,Menlo,monospace;color:#9aa1ad;overflow:hidden;` +
+    `text-overflow:ellipsis;white-space:nowrap">${escapeHtml(url)}</span></div>`;
+
+  const content = /html/i.test(contentType)
+    ? text
+    : `<pre style="margin:0;padding:16px;background:#14161a;color:#e6e8ec;min-height:100vh;` +
+      `font:13px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word">` +
+      `${escapeHtml(prettify(text, contentType))}</pre>`;
+
+  document.open();
+  document.write(`<base href="${escapeHtml(url)}">${bar}${content}`);
+  document.close();
+  document.getElementById('__back').addEventListener('click', () => location.reload());
+}
+
+function updateBodyState() {
+  const method = $('method').value;
+  const allowed = !['GET', 'HEAD'].includes(method);
+  $('body').disabled = !allowed;
+  $('body-note').textContent = allowed ? '' : `${method} requests cannot have a body`;
+}
+
+$('add-header').addEventListener('click', () => addHeaderRow().querySelector('input').focus());
+$('add-param').addEventListener('click', () => addParamRow().querySelector('input').focus());
+$('extract-params').addEventListener('click', extractParams);
+$('method').addEventListener('change', updateBodyState);
+$('url').addEventListener('input', updatePreview);
+paramsEl.addEventListener('input', updatePreview);
+
+// One pair of listeners on the form covers every field, including rows added later. `change`
+// catches the method select and the checkbox on browsers that do not fire `input` for them.
+$('form').addEventListener('input', scheduleSave);
+$('form').addEventListener('change', scheduleSave);
+
+$('form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+
+  const method = $('method').value;
+  const url = buildUrl();
+  const body = $('body').value;
+  const sendButton = $('send');
+
+  const headers = collectHeaders();
+  // Fetch first, then test the URL: on the very first send `backend.url` is only
+  // known once the token has arrived. A header typed into the form always wins.
+  const token = hasHeader(headers, 'authorization') ? null : await backendToken();
+  const authenticated = Boolean(token) && targetsBackend(url);
+  if (authenticated) headers.Authorization = `Bearer ${token.token}`;
+
+  const init = { method, headers };
+  if (!['GET', 'HEAD'].includes(method) && body !== '') init.body = body;
+
+  sendButton.disabled = true;
+  sendButton.textContent = 'Sending…';
+  $('result').classList.remove('hide');
+  $('result-meta').textContent = '';
+  $('result-headers-wrap').classList.add('hide');
+  $('result-body').textContent = 'Waiting for response…';
+
+  const started = performance.now();
+  try {
+    const response = await fetch(url, init);
+    const elapsed = Math.round(performance.now() - started);
+    const text = await response.text();
+    const contentType = response.headers.get('content-type') || '';
+
+    if ($('replace-page').checked) {
+      replacePageWith(text, response.url || url, contentType);
+      return;
+    }
+
+    const statusClass = response.ok ? 'status-ok' : 'status-err';
+    $('result-meta').innerHTML = `
+      <span class="${statusClass}">${response.status} ${escapeHtml(response.statusText)}</span>
+      <span>${elapsed} ms</span>
+      <span>${text.length} bytes</span>
+      ${authenticated ? '<span>Bearer token sent</span>' : ''}`;
+
+    const responseHeaders = [...response.headers.entries()]
+      .map(([name, value]) => `${name}: ${value}`)
+      .join('\n');
+    $('result-headers').textContent = responseHeaders || '(no headers exposed by CORS)';
+    $('result-headers-wrap').classList.remove('hide');
+
+    $('result-body').textContent =
+      text === '' ? '(empty body)' : prettify(text, contentType);
+  } catch (error) {
+    const elapsed = Math.round(performance.now() - started);
+    $('result-meta').innerHTML =
+      `<span class="status-err">Request failed</span><span>${elapsed} ms</span>`;
+    $('result-body').textContent =
+      `${error}\n\nCommon causes: invalid URL, network failure, or the response was blocked by CORS.`;
+  } finally {
+    sendButton.disabled = false;
+    sendButton.textContent = 'Send';
+  }
+});
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (char) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+}
+
+if (!restoreState()) {
+  addParamRow();
+  addHeaderRow('Accept', 'application/json');
+  addHeaderRow();
+}
+updateBodyState();
+updatePreview();
+</script>
+</body>
+</html>

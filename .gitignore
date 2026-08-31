@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+# .env holds the configuration and is committed; secrets go in .env.local.
+.env.local
+
