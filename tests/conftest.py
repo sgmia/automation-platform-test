@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -94,6 +95,31 @@ def backend(entra, monkeypatch):
     # and an asyncio.Lock may not be reused across loops.
     credentials._lock = asyncio.Lock()
     handle.credentials = credentials
+    return handle
+
+
+@pytest.fixture
+def forwarding(backend, monkeypatch):
+    """Answer the backend itself, and record what was sent to it.
+
+    `.requests` lists every outbound request the proxy made, so a test can assert on
+    the headers it attached -- and, just as much, that no request was made at all.
+    `.reply` can be reassigned to answer differently, or raise.
+    """
+    handle = SimpleNamespace(requests=[], reply=None)
+    handle.reply = lambda request: httpx2.Response(
+        200,
+        headers=[("content-type", "text/plain"), ("x-from", "the backend")],
+        content=b"hello",
+        request=request,
+    )
+
+    async def request(method, url, headers=None, content=None):
+        outgoing = httpx2.Request(method, url, headers=headers, content=content)
+        handle.requests.append(outgoing)
+        return handle.reply(outgoing)
+
+    monkeypatch.setattr(main.proxy._client, "request", request)
     return handle
 
 

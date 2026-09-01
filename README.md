@@ -2,9 +2,10 @@
 
 A browser-based HTTP request tool, served behind Microsoft Entra ID sign-in.
 
-The page lets you compose a request — method, URL, URL parameters, headers, body — send it from the
-browser, and inspect the status, response headers and body. Nobody reaches it without a valid Entra ID
-account in the tenant.
+The page lets you compose a request — method, URL, URL parameters, headers, body — send it, and inspect
+the status, response headers and body. Nobody reaches it without a valid Entra ID account in the
+tenant. Requests to a configured backend API are made by the server, with the credentials for it; every
+other request is sent straight from the browser.
 
 ## Requirements
 
@@ -64,7 +65,8 @@ project root — if you don't, it exits with a message naming the directory it s
 | `ENTRA_BACKEND_CLIENT_ID` | — | Client ID of the app registration used to call the backend. |
 | `ENTRA_BACKEND_CLIENT_SECRET` | — | Its client secret. Stays on the server. |
 | `ENTRA_BACKEND_SCOPE` | — | Usually `api://<backend-app-id>/.default`. |
-| `ENTRA_BACKEND_URL` | — | The backend's base URL. The token is sent only to this prefix. |
+| `ENTRA_BACKEND_URL` | — | The backend's base URL. The only prefix this server will forward a request to. |
+| `ENTRA_BACKEND_TIMEOUT` | `30.0` | Timeout for a forwarded request. Separate from `ENTRA_HTTP_TIMEOUT`: an API can take longer to answer than Entra ID does. |
 
 Serving over HTTPS is a matter of setting `ENTRA_BASE_URL` to the `https://` URL and adding the
 matching redirect URI to the app registration.
@@ -72,8 +74,8 @@ matching redirect URI to the app registration.
 ## Calling a backend API
 
 The four `ENTRA_BACKEND_*` settings turn on authenticated calls to a backend. Set all four, or the
-feature stays off and requests are sent unauthenticated. The secret goes in `.env.local`, the rest in
-`.env`:
+feature stays off and every request is sent from the browser, unauthenticated. The secret goes in
+`.env.local`, the rest in `.env`:
 
 ```ini
 # .env
@@ -91,93 +93,79 @@ credentials flow uses application permissions, not delegated ones. The server ex
 an access token at startup and renews it five minutes before it expires, so a request never carries a
 token that dies in flight.
 
-The page then sends that token as `Authorization: Bearer …`, and the response panel says
-`Bearer token sent` when it did.
+### The request is made by the server, not by the page
 
-**The token is only ever attached to URLs at or below `ENTRA_BACKEND_URL`.** This tool sends requests
-to whatever URL you type, and a backend access token is a credential for the application itself — so
-attaching it unconditionally would hand it to any host you pointed the tool at. The check compares the
-full origin (scheme, host and port) and requires a real path-segment prefix, so `https://backend…/apiXX`
-does not match `/api`. A note under the URL field says which case applies, and an `Authorization`
-header you add by hand always wins.
+A request aimed at the backend is **not sent from the browser**. The page posts what it wants sent to
+`POST /api/send`, and this server makes the call, attaching:
 
-Note that this token authenticates the *application*, not the signed-in user: everyone who can sign in
-gets the same one, with the same permissions.
+| Header | What it is |
+| --- | --- |
+| `Authorization: Bearer …` | The application's access token, from the client credentials flow. Says *which application* is calling; every signed-in user gets the same one, with the same permissions. |
+| `token: <id_token>` | The signed-in visitor's own id_token, out of their session cookie. Says *who* is calling. |
 
-So that a backend can tell **who** is calling, the page also sends the signed-in visitor's `id_token`
-in a header named `token`, next to the `Authorization` header, and the response panel says `id_token
-sent` when it did. It comes from `GET /oauth2/id-token`, which hands a visitor their own token and no
-one else's, out of the session cookie.
+**Neither ever reaches a browser.** There is no route that hands out either token, so there is nothing
+for a page — or anything running in it — to read and send somewhere else. The response comes back to
+the page as JSON and is displayed as usual; the panel lists which headers the server added, and an
+`Authorization` or `token` header you type into the form is forwarded as you typed it instead.
 
-**The `token` header follows the same rule as the bearer token: `ENTRA_BACKEND_URL` only.** It is a
-bearer assertion of the user's identity, so a host you typed into the tool must never receive it. A
-`token` header you add by hand wins, as with `Authorization`.
+**Only URLs at or below `ENTRA_BACKEND_URL` are forwarded**, and here that check is the entire security
+boundary rather than a nicety. The tool sends requests to whatever URL you type, so without it this
+route would forward the application's credentials — and the server's network position, which is
+usually further inside than your laptop — to any host a signed-in visitor named. Anything else is
+refused with a 400 before a single byte is sent, and the page sends it straight from the browser
+instead, with nothing of this application's attached.
+
+The check compares the full origin (scheme, host and port) and requires a real path-segment prefix, so
+`https://backend…/apiXX` does not match `/api`. It is applied to the URL *as the HTTP client will
+request it*, which matters: `https://backend…/api/../admin` is `/admin` by the time it goes out, and a
+check on the text would have seen it start with `/api/`.
+
+Two more things the server does with a forwarded request:
+
+- **Redirects are not followed.** A `302` is handed back to the page as the response. Following one
+  would take the credentials wherever `Location` pointed, which need not be the backend.
+- **Nothing of the browser's own hop is passed on** — not its cookies (including the session cookie),
+  not its user agent. Only the method, URL, headers and body the form asked for.
 
 The backend should validate that `id_token` as a token in its own right — signature against the
 tenant's JWKS, issuer, and an audience of `ENTRA_CLIENT_ID` (this app, not the backend's own client
 id). It is *not* an access token for the backend API: proper delegated access would be the
 on-behalf-of flow, which exchanges this token for one the backend is the audience of.
 
-### What the backend has to allow (CORS, and the preflight)
+### What the backend has to allow
 
-The tool sends its requests **from the browser**, so a call to the backend is cross-origin: from
-`ENTRA_BASE_URL` to `ENTRA_BACKEND_URL`. Because those requests carry `Authorization` and a custom
-`token` header, neither of which is CORS-safelisted, the browser sends a **preflight `OPTIONS`** first
-and only makes the real request if it is answered.
+**Nothing.** Because the request is made from the server, it is not cross-origin, so CORS does not
+apply to it: no `Access-Control-*` headers, and no preflight `OPTIONS` to answer before the real
+request. Every response header comes back to the page, not the handful a browser would expose.
 
-**The preflight cannot be authenticated, and it is not a gap that it isn't.** The browser composes it
-itself, and by specification it carries none of the request's headers and no credentials — no
-`Authorization`, no `token`, not even cookies. Nothing the page does can attach anything to it. A
-backend that requires authentication on `OPTIONS` therefore rejects every browser client it has, this
-tool included, and the failure surfaces in the page as an opaque `Request failed` rather than as the
-401 that was actually returned. There is nothing to protect: a preflight response is a handful of
-`Access-Control-*` headers and an empty body.
+This is worth knowing if you are used to the other arrangement. A browser preflight carries no
+credentials at all — by specification it has no `Authorization`, no custom headers and no cookies — so
+a backend that requires authentication on `OPTIONS` blocks every browser client it has, and there is
+nothing a page can do about it. Sending from the server sidesteps that question rather than answering
+it.
 
-So the backend must answer `OPTIONS` **before its authentication runs**, with `204` and:
-
-```http
-Access-Control-Allow-Origin: http://localhost:3000
-Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE
-Access-Control-Allow-Headers: authorization, token, content-type
-Access-Control-Max-Age: 600
-```
-
-and repeat `Access-Control-Allow-Origin` on the real response.
-
-Four things that catch people out:
-
-- **`Access-Control-Allow-Headers: *` does not cover `Authorization`.** The wildcard is defined not to
-  match it; it has to be named. `token` is a custom header and must be named too — it is the one that
-  turns even a plain `GET` into a preflighted request.
-- **`Max-Age` matters.** Without it a preflight goes out ahead of *every* request, doubling the round
-  trips. Browsers cap it (Chrome at 2 hours, Firefox at 24) so a large value is harmless.
-- **`Access-Control-Allow-Origin` must be the origin only** — `http://localhost:3000`, no path, no
-  trailing slash. `*` is also accepted here, because the page does not send credentials cross-origin,
-  but naming the origin is the better default.
-- **Response headers stay invisible unless exposed.** The browser only lets the page read the few
-  safelisted ones, which is why the response panel can say `(no headers exposed by CORS)`. Add
-  `Access-Control-Expose-Headers` naming whatever you want to see.
+Requests to anything else are still sent by the browser and are still subject to CORS in the usual
+way.
 
 ## The tool
 
 - **Method, URL and body.** The body is disabled for methods that cannot carry one.
 - **URL parameters** as name/value rows, with a live preview of the assembled request URL and an
   **Extract from URL** button that pulls an existing query string apart into rows.
-- **Headers** as name/value rows, with the ones the page adds for the backend — `Authorization` and
-  `token` — listed below them as disabled rows. Their values are masked (`Bearer •••••••••••••••• (1462
-  characters)`): the point is to show *that* a credential is attached and how big it is, without
-  putting it on screen for a screenshot or a shoulder to catch. They are sent in full. A header you
-  type yourself wins and drops the matching row from the list.
+- **Headers** as name/value rows, with the ones the server will add for the backend — `Authorization`
+  and `token` — listed below them as disabled rows reading *added by this server*. There is no value
+  to show: the page never receives either token. A header you type yourself wins and drops the
+  matching row from the list.
 - **Replace this page with the response** — renders the response body as the entire document, for when
   you want to look at returned HTML rather than at its source. Reload to come back; the form is
   restored as you left it.
 
-Requests are sent by the browser with `fetch`, so they are subject to CORS: a response from a server
-that does not send the right CORS headers will fail, and so will a request whose preflight is refused.
-That is a browser restriction, not a limitation of the tool — see [what the backend has to
-allow](#what-the-backend-has-to-allow-cors-and-the-preflight). `fetch` defaults to
-`credentials: 'same-origin'` and the page does not change it, so your cookies go to this server and
-nowhere else; a cross-origin target gets no cookies, only the headers listed above.
+A request to the backend is [made by this server](#the-request-is-made-by-the-server-not-by-the-page)
+and the response panel says `sent by this server`, along with which headers it added. Everything else
+is sent by the browser with `fetch`, and is subject to CORS: a response from a server that does not
+send the right CORS headers will fail, and so will a request whose preflight is refused. That is a
+browser restriction, not a limitation of the tool. `fetch` defaults to `credentials: 'same-origin'`
+and the page does not change it, so your cookies go to this server and nowhere else.
 
 ## Routes
 
@@ -188,8 +176,11 @@ nowhere else; a cross-origin target gets no cookies, only the headers listed abo
 | `POST /oauth2/token` | Where Entra ID posts the `id_token`. |
 | `GET /oauth2/logout` | Clear the session cookie. |
 | `GET /oauth2/me` | The claims of the validated token this session came from. |
-| `GET /oauth2/id-token` | The visitor's own `id_token`, for the page to send to the backend. Requires a session. |
-| `GET /oauth2/backend-token` | A backend access token for the page. Requires a session; 404 when no backend is configured. |
+| `GET /api/backend` | Whether a backend is configured, and its URL — so the page knows which requests to route through this server. Requires a session. |
+| `POST /api/send` | Make a request to the backend, with both credentials attached here. Requires a session; 400 for any URL outside `ENTRA_BACKEND_URL`, 404 when no backend is configured. |
+
+No route hands out a token. `/api/*` answers `401` rather than redirecting, because a `fetch` cannot
+follow a redirect to Microsoft.
 
 ## How sign-in works
 
@@ -230,14 +221,19 @@ node tests/page.js            # the page's send path, outside pytest
 The tests stub Entra ID's endpoints in memory and mint their own tokens with throwaway RSA keys, so the
 suite runs offline in a fraction of a second. Most of it is about the ways an `id_token` can be wrong:
 expired, wrong audience, wrong tenant, unknown signing key, tampered payload, missing claims, replayed
-nonce, unsigned, algorithm-confused. The rest covers the sign-in round trip, path handling, and backend
-token caching and renewal.
+nonce, unsigned, algorithm-confused. The rest covers the sign-in round trip, path handling, backend
+token caching and renewal, and which URLs the server will and will not forward a credential to.
+
+`node tests/page.js` is not part of the pytest suite and nothing runs it for you. It runs the page's
+real script against a small DOM shim, and is what proves the browser holds no token and hands only
+backend URLs to `/api/send`.
 
 Layout:
 
 ```
 src/entra_server/
   main.py       FastAPI app: routes, auth dependency, static serving
+  backend.py    forwarding a request to the backend, with the credentials attached
   oidc.py       discovery, signing keys, id_token validation, backend tokens
   sessions.py   signed session cookies, and pending logins in memory
   settings.py   configuration

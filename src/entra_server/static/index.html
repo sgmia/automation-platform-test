@@ -153,7 +153,8 @@
       </div>
       <div id="headers"></div>
       <div id="added-headers" class="hide">
-        <p class="note">Added automatically for the backend. The values are masked; they are sent in full.</p>
+        <p class="note">Added by this server when it forwards the request. The values are never sent to
+          the browser, so there is nothing here to show.</p>
         <div id="added-header-rows"></div>
       </div>
     </section>
@@ -177,9 +178,10 @@
     <label>Body</label>
     <pre id="result-body"></pre>
     <p class="note">
-      Requests are made from the browser, so they are subject to CORS. If the target server does not
-      send <code>Access-Control-Allow-Origin</code>, the request fails and only a limited set of
-      response headers is visible.
+      Requests to the backend are made by this server, so CORS does not apply to them and every
+      response header is shown. Anything else is sent from the browser: if that server does not send
+      <code>Access-Control-Allow-Origin</code>, the request fails and only a limited set of response
+      headers is visible.
     </p>
   </section>
 </main>
@@ -230,90 +232,61 @@ function collectHeaders() {
 }
 
 // ---------------------------------------------------------------------------
-// Backend access token
+// The backend
 //
-// The client credentials flow runs on the server, so the client secret never
-// reaches the browser -- this only fetches the resulting access token. It is
-// attached exclusively to requests aimed at the configured backend, never to
-// whatever URL happens to be in the form.
+// Requests to the backend are not sent from here. They are posted to this server,
+// which attaches the application's access token and the visitor's id_token and
+// makes the call itself, so neither credential is ever in the browser: there is
+// nothing in this page for a URL typed into it to capture.
+//
+// All this fetches is where the backend is, which is what decides whether a URL
+// goes through the server or straight out of the browser.
 // ---------------------------------------------------------------------------
-const backend = { token: null, url: '', expiresAt: 0, disabled: false, error: '' };
+const backend = { url: '', enabled: false, loaded: false, error: '' };
 let backendInFlight = null;
 
-async function fetchBackendToken() {
-  const response = await fetch('/oauth2/backend-token', { headers: { Accept: 'application/json' } });
-  if (response.status === 404) {  // no backend configured on this server
-    backend.disabled = true;
-    return null;
-  }
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+async function fetchBackend() {
+  const response = await fetch('/api/backend', { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(await failureOf(response));
 
   const data = await response.json();
-  backend.token = data.access_token;
-  backend.url = data.backend_url;
-  // The server renews well before the real expiry; drop our copy a little sooner still.
-  backend.expiresAt = performance.now() + Math.max(1, data.expires_in - 30) * 1000;
+  backend.enabled = data.enabled;
+  backend.url = data.url;
+  backend.loaded = true;
   backend.error = '';
   return backend;
 }
 
-// Cached until it is nearly stale, and de-duplicated so that typing in the URL
-// field cannot start a fetch per keystroke.
-function backendToken() {
-  if (backend.disabled) return Promise.resolve(null);
-  if (backend.token && performance.now() < backend.expiresAt) return Promise.resolve(backend);
+// Read once and kept: unlike a token, none of this expires. De-duplicated so that
+// typing in the URL field cannot start a fetch per keystroke.
+function backendInfo() {
+  if (backend.loaded) return Promise.resolve(backend);
   if (!backendInFlight) {
-    backendInFlight = fetchBackendToken()
+    backendInFlight = fetchBackend()
       .catch((error) => {
-        backend.token = null;
         backend.error = String(error);
-        return null;
+        return backend;
       })
       .finally(() => { backendInFlight = null; });
   }
   return backendInFlight;
 }
 
-// ---------------------------------------------------------------------------
-// The visitor's own id_token
-//
-// The backend token above says which application is calling, never which person.
-// A backend that needs to know who is signed in gets the id_token instead, in a
-// `token` header -- and under exactly the same scope rule, because it is a bearer
-// assertion of the user's identity and must not reach a host they typed in.
-// ---------------------------------------------------------------------------
-const identity = { token: null, expiresAt: 0, error: '' };
-let identityInFlight = null;
-
-async function fetchIdToken() {
-  const response = await fetch('/oauth2/id-token', { headers: { Accept: 'application/json' } });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-
-  const data = await response.json();
-  identity.token = data.id_token;
-  // It comes out of the session cookie, so it expires with the session.
-  identity.expiresAt = performance.now() + Math.max(1, data.expires_in - 30) * 1000;
-  identity.error = '';
-  return identity.token;
-}
-
-// Cached and de-duplicated, as the backend token is.
-function idToken() {
-  if (identity.token && performance.now() < identity.expiresAt) return Promise.resolve(identity.token);
-  if (!identityInFlight) {
-    identityInFlight = fetchIdToken()
-      .catch((error) => {
-        identity.token = null;
-        identity.error = String(error);
-        return null;
-      })
-      .finally(() => { identityInFlight = null; });
+// This server reports what went wrong in a JSON `detail`; anything else is a
+// status line. Either way it is something to show rather than swallow.
+async function failureOf(response) {
+  const fallback = `${response.status} ${response.statusText}`;
+  try {
+    const data = await response.json();
+    return data && data.detail ? data.detail : fallback;
+  } catch {
+    return fallback;
   }
-  return identityInFlight;
 }
 
-// True only for URLs at or below the backend prefix, so a token is never sent
-// to another origin -- or to a lookalike path like /apiXX next to /api.
+// True only for URLs at or below the backend prefix. The server checks this again
+// before it forwards anything -- there it is the boundary, here it only decides
+// which of the two ways to send.
 function targetsBackend(requestUrl) {
   if (!backend.url) return false;
   let target, base;
@@ -331,12 +304,16 @@ function targetsBackend(requestUrl) {
 const hasHeader = (headers, name) =>
   Object.keys(headers).some((key) => key.toLowerCase() === name);
 
-// Enough to see that a credential is attached, and its size, without putting it on
-// screen -- where it could be read over a shoulder or captured in a screenshot.
-const mask = (secret) => `${'•'.repeat(16)} (${secret.length} characters)`;
+// Response headers arrive as pairs, because a name can repeat (set-cookie does).
+const headerValue = (pairs, name) =>
+  (pairs.find(([key]) => key.toLowerCase() === name) || [])[1] || '';
 
-// The headers the page adds by itself, shown as disabled rows under the ones typed in,
-// so what actually leaves the browser is visible rather than implied by a note.
+// There is no value to show: the credentials are attached after the request leaves
+// the browser, and this page never holds either of them.
+const ADDED_BY_SERVER = 'added by this server';
+
+// The headers the server will add, shown as disabled rows under the ones typed in,
+// so what is actually sent is visible rather than implied by a note.
 function showAddedHeaders(added) {
   addedHeadersEl.classList.toggle('hide', !added.length);
   addedRowsEl.replaceChildren();
@@ -361,35 +338,29 @@ async function updateAuthNote() {
   // Read the URL before awaiting anything, so what is shown belongs to the URL as it
   // was when the note was asked for.
   const url = buildUrl();
-  const token = await backendToken();
+  await backendInfo();
   const matches = targetsBackend(url);
-  const signedIn = matches ? await idToken() : null;
-  // "Replace this page" can land while those fetches are in flight, and it takes the
+  // "Replace this page" can land while that fetch is in flight, and it takes the
   // form -- every element touched below -- out of the document.
   if (pageReplaced) return;
 
-  // Exactly the headers the submit handler will add, under the same conditions -- a
-  // header typed into the form wins, so it is not listed as added either.
+  // Exactly the headers the server will add, under the same conditions -- a header
+  // typed into the form wins, so it is not listed as added either.
   const typed = collectHeaders();
   const added = [];
-  if (token && matches && !hasHeader(typed, 'authorization')) {
-    added.push(['Authorization', `Bearer ${mask(token.token)}`]);
-  }
-  if (signedIn && !hasHeader(typed, 'token')) {
-    added.push(['token', mask(signedIn)]);
-  }
+  if (matches && !hasHeader(typed, 'authorization')) added.push(['Authorization', ADDED_BY_SERVER]);
+  if (matches && !hasHeader(typed, 'token')) added.push(['token', ADDED_BY_SERVER]);
   showAddedHeaders(added);
 
-  // With the rows above showing what is attached, the note is only for the cases where
-  // nothing is: a token that could not be fetched, or a URL somewhere else entirely.
+  // With the rows above showing what is attached, the note is only for the cases
+  // where nothing is: a URL somewhere else entirely, or a server that did not answer.
   const note = $('auth-note');
   let text = '';
-  if (backend.error && matches) {
-    text = `Backend token unavailable (${backend.error}). Reload if your sign-in has expired.`;
-  } else if (token && matches && !signedIn) {
-    text = 'Your id_token is unavailable, so only the backend token will be added.';
-  } else if (token && !matches) {
-    text = `A backend token and your id_token are available, but they are only sent to ${backend.url}`;
+  if (backend.error) {
+    text = `Could not ask this server about the backend (${backend.error})`;
+  } else if (backend.enabled && !matches) {
+    text = `Sent from this browser. Only requests to ${backend.url} go through the server, `
+      + 'which is the only place the credentials exist.';
   }
 
   note.textContent = text;
@@ -573,6 +544,40 @@ headersEl.addEventListener('input', updateAuthNote);
 $('form').addEventListener('input', scheduleSave);
 $('form').addEventListener('change', scheduleSave);
 
+const withoutBody = (method) => ['GET', 'HEAD'].includes(method);
+
+// Sent by the browser, as typed, to whatever was asked for. No credential of this
+// application goes with it -- there is none here to send.
+async function sendDirect(method, url, headers, body) {
+  const init = { method, headers };
+  if (!withoutBody(method) && body !== '') init.body = body;
+
+  const response = await fetch(url, init);
+  return {
+    status: response.status,
+    reason: response.statusText,
+    url: response.url || url,
+    headers: [...response.headers.entries()],
+    body: await response.text(),
+    added: [],
+    truncated: false,
+    viaServer: false,
+  };
+}
+
+// Handed to this server, which attaches the credentials and makes the call. Same
+// origin, so no CORS and no preflight, and it returns every response header rather
+// than the few a browser would expose.
+async function sendViaServer(method, url, headers, body) {
+  const response = await fetch('/api/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ method, url, headers, body: withoutBody(method) ? null : body }),
+  });
+  if (!response.ok) throw new Error(await failureOf(response));
+  return { ...await response.json(), viaServer: true };
+}
+
 $('form').addEventListener('submit', async (event) => {
   event.preventDefault();
 
@@ -580,21 +585,12 @@ $('form').addEventListener('submit', async (event) => {
   const url = buildUrl();
   const body = $('body').value;
   const sendButton = $('send');
-
   const headers = collectHeaders();
-  // Fetch first, then test the URL: on the very first send `backend.url` is only
-  // known once the token has arrived. A header typed into the form always wins.
-  const token = await backendToken();
-  const forBackend = targetsBackend(url);
-  const authenticated = Boolean(token) && forBackend && !hasHeader(headers, 'authorization');
-  if (authenticated) headers.Authorization = `Bearer ${token.token}`;
 
-  // Who is calling, alongside which application is calling.
-  const identified = forBackend && !hasHeader(headers, 'token') && Boolean(await idToken());
-  if (identified) headers.token = identity.token;
-
-  const init = { method, headers };
-  if (!['GET', 'HEAD'].includes(method) && body !== '') init.body = body;
+  // Read the configuration first, then test the URL: on the very first send it is
+  // only known once /api/backend has answered.
+  await backendInfo();
+  const viaServer = targetsBackend(url);
 
   sendButton.disabled = true;
   sendButton.textContent = 'Sending…';
@@ -605,46 +601,50 @@ $('form').addEventListener('submit', async (event) => {
 
   const started = performance.now();
   try {
-    const response = await fetch(url, init);
+    const result = viaServer
+      ? await sendViaServer(method, url, headers, body)
+      : await sendDirect(method, url, headers, body);
     const elapsed = Math.round(performance.now() - started);
-    const text = await response.text();
-    const contentType = response.headers.get('content-type') || '';
+    const contentType = headerValue(result.headers, 'content-type');
+    const text = result.truncated
+      ? `${result.body}\n\n(truncated by the server: the response was larger than it will return)`
+      : result.body;
 
     if ($('replace-page').checked) {
-      replacePageWith(text, response.url || url, contentType);
+      replacePageWith(text, result.url, contentType);
       return;
     }
 
-    const statusClass = response.ok ? 'status-ok' : 'status-err';
+    const ok = result.status >= 200 && result.status < 300;
     $('result-meta').innerHTML = `
-      <span class="${statusClass}">${response.status} ${escapeHtml(response.statusText)}</span>
+      <span class="${ok ? 'status-ok' : 'status-err'}">${result.status} ${escapeHtml(result.reason)}</span>
       <span>${elapsed} ms</span>
-      <span>${text.length} bytes</span>
-      ${authenticated ? '<span>Bearer token sent</span>' : ''}
-      ${identified ? '<span>id_token sent</span>' : ''}`;
+      <span>${result.body.length} bytes</span>
+      ${result.viaServer ? '<span>sent by this server</span>' : ''}
+      ${result.added.map((name) => `<span>${escapeHtml(name)} added</span>`).join('')}`;
 
-    const responseHeaders = [...response.headers.entries()]
-      .map(([name, value]) => `${name}: ${value}`)
-      .join('\n');
-    $('result-headers').textContent = responseHeaders || '(no headers exposed by CORS)';
+    const responseHeaders = result.headers.map(([name, value]) => `${name}: ${value}`).join('\n');
+    $('result-headers').textContent =
+      responseHeaders || (result.viaServer ? '(no response headers)' : '(no headers exposed by CORS)');
     $('result-headers-wrap').classList.remove('hide');
 
-    $('result-body').textContent =
-      text === '' ? '(empty body)' : prettify(text, contentType);
+    $('result-body').textContent = text === '' ? '(empty body)' : prettify(text, contentType);
   } catch (error) {
     const elapsed = Math.round(performance.now() - started);
     $('result-meta').innerHTML =
       `<span class="status-err">Request failed</span><span>${elapsed} ms</span>`;
-    $('result-body').textContent =
-      `${error}\n\nCommon causes: invalid URL, network failure, or the response was blocked by CORS.`;
+    $('result-body').textContent = viaServer
+      ? `${error}\n\nThis request goes through the server, so CORS is not involved: the`
+        + ' server could not reach the backend, or would not forward what was asked.'
+      : `${error}\n\nCommon causes: invalid URL, network failure, or the response was blocked by CORS.`;
   } finally {
     // `finally` runs even where the response replaced the document, and then there is no
     // button to re-enable and no rows to redraw -- only elements document.write() removed.
     if (!pageReplaced) {
       sendButton.disabled = false;
       sendButton.textContent = 'Send';
-      // The first send is what fetches the tokens, so the rows above only become
-      // accurate once it has happened.
+      // The first send may be what fetched the configuration, so the rows above only
+      // become accurate once it has happened.
       updateAuthNote();
     }
   }

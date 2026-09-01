@@ -57,7 +57,11 @@ class Settings(BaseSettings):
     backend_client_id: str = ""
     backend_client_secret: SecretStr = SecretStr("")
     backend_scope: str = ""  # usually api://<backend-app-id>/.default
-    backend_url: str = ""  # only requests to this prefix are given the token
+    backend_url: str = ""  # the only prefix requests are ever forwarded to
+
+    # How long to wait on the backend itself. Not part of `backend_enabled`: it has
+    # a default, and an API can be slower to answer than Entra ID is.
+    backend_timeout: float = 30.0
 
     @property
     def issuer(self) -> str:

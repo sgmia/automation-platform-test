@@ -8,7 +8,6 @@ from pydantic import SecretStr
 
 from entra_server.oidc import ClientCredentials, TokenError
 from entra_server.settings import settings
-from tests.conftest import BACKEND_URL
 
 # ---------------------------------------------------------------------------
 # Fetching
@@ -133,40 +132,5 @@ def test_every_backend_setting_is_required(backend, monkeypatch, missing, empty)
     assert not settings.backend_enabled
 
 
-# ---------------------------------------------------------------------------
-# The route
-# ---------------------------------------------------------------------------
-
-
-def test_token_route_requires_a_session(client, backend):
-    assert client.get("/oauth2/backend-token").status_code == 302
-
-
-def test_signed_in_visitor_gets_a_token(client, backend, sign_in):
-    sign_in()
-    response = client.get("/oauth2/backend-token")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "access_token": "backend-token-0",
-        "expires_in": 3600 - ClientCredentials.RENEW_MARGIN,
-        "backend_url": BACKEND_URL,
-    }
-
-
-def test_token_route_is_absent_when_no_backend_is_configured(client, sign_in, monkeypatch):
-    monkeypatch.setattr(settings, "backend_client_id", "")
-    sign_in()
-    assert client.get("/oauth2/backend-token").status_code == 404
-
-
-def test_token_route_reports_a_failure_without_leaking_the_reason(client, backend, sign_in):
-    backend.reply = lambda: {
-        "error": "invalid_client",
-        "error_description": "AADSTS7000215: Invalid client secret provided.",
-    }
-    sign_in()
-    response = client.get("/oauth2/backend-token")
-
-    assert response.status_code == 503
-    assert "AADSTS7000215" not in response.text  # that belongs in the log, not the browser
+# No route hands one of these to a browser. What is done with them -- attaching one
+# to a request the server makes itself -- is in tests/test_proxy.py.

@@ -1,10 +1,17 @@
 /*
  * The page's send path, under node: `node tests/page.js` (no dependencies, no runner).
  *
- * pytest never loads index.html, so the rule that decides which credentials leave the
- * browser -- the backend access token in `Authorization`, and the visitor's id_token in
- * `token` -- has no Python test. This runs the real script from the HTML against a DOM
- * shim just big enough to dispatch a submit and see what `fetch` was handed.
+ * pytest never loads index.html, so the rule that decides how a request leaves the
+ * browser -- posted to this server, which attaches the credentials, or sent straight
+ * from the page with none -- has no Python test. This runs the real script from the
+ * HTML against a DOM shim just big enough to dispatch a submit and see what `fetch`
+ * was handed.
+ *
+ * What it is really for: nothing the page can be made to do should get a credential
+ * out of this server for a host that is not the backend. The tokens are no longer in
+ * the browser at all, so what is checked here is that a lookalike URL cannot get its
+ * request forwarded -- and, on the server side, tests/test_proxy.py checks the same
+ * URLs again, because that is where the boundary actually is.
  *
  * It is a shim, not a browser: it knows only the handful of DOM features the page uses,
  * so a change to the page may need a change here. Prints a line per check and exits
@@ -67,6 +74,7 @@ for (const id of ['method', 'url', 'body', 'replace-page', 'send', 'form', 'head
                   'added-headers', 'added-header-rows']) {
   ids[id] = new El('div');
 }
+ids.method.value = 'GET';  // the first <option>, as a browser would have it
 
 // document.open() discards the current document. Everything the page held on to is then
 // detached, and getElementById finds only what was written in its place -- which is what
@@ -85,20 +93,27 @@ global.location = { protocol: 'https:', reload() {} };
 global.performance = { now: () => Date.now() };
 
 const BACKEND = 'https://backend.example.com/api/';
-const ID_TOKEN = 'the.id.token';
 const json = (body) => ({
   ok: true, status: 200, statusText: 'OK',
   headers: new Map([['content-type', 'application/json']]),
   json: async () => body,
 });
 
+// What the page asked for, whichever way it went: `sent.url` is where the browser
+// pointed fetch, and `sent.forwarded` is the payload if it went through the server.
 let sent = null;
 global.fetch = async (url, init) => {
-  if (url === '/oauth2/backend-token') {
-    return json({ access_token: 'backend-access-token', expires_in: 3600, backend_url: BACKEND });
+  if (url === '/api/backend') return json({ enabled: true, url: BACKEND });
+
+  sent = { url, init, forwarded: null };
+  if (url === '/api/send') {
+    sent.forwarded = JSON.parse(init.body);
+    return json({
+      status: 200, reason: 'OK', url: sent.forwarded.url,
+      headers: [['content-type', 'text/plain'], ['x-from', 'the backend']],
+      body: 'hello', added: ['Authorization', 'token'], truncated: false,
+    });
   }
-  if (url === '/oauth2/id-token') return json({ id_token: ID_TOKEN, expires_in: 1800 });
-  sent = { url, init };
   return {
     ok: true, status: 200, statusText: 'OK', url,
     headers: new Map([['content-type', 'text/plain']]),
@@ -125,15 +140,15 @@ async function fillIn(url, headerRows = []) {
   await settle();
 }
 
-/** Submit the form and return the headers fetch was handed. */
+/** Submit the form, and return what fetch was handed. */
 async function send(url, headerRows = []) {
   sent = null;
   await fillIn(url, headerRows);
   await ids.form.dispatch('submit');
-  return sent.init.headers;
+  return sent;
 }
 
-/** The name/value pairs shown in the "added automatically" rows. */
+/** The name/value pairs shown in the "added by this server" rows. */
 const addedRows = () =>
   ids['added-header-rows'].children.map((row) => row.querySelectorAll('input').map((i) => i.value));
 
@@ -146,9 +161,16 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 (async () => {
   const backend = await send(BACKEND + 'things');
-  assert.strictEqual(backend.token, ID_TOKEN);
-  assert.strictEqual(backend.Authorization, 'Bearer backend-access-token');
-  console.log('ok  a request to the backend carries both tokens');
+  assert.strictEqual(backend.url, '/api/send');
+  assert.deepStrictEqual(backend.forwarded, {
+    method: 'GET', url: BACKEND + 'things', headers: {}, body: null,
+  });
+  console.log('ok  a request to the backend is handed to this server to make');
+
+  // Nothing of the browser's own goes with it: the credentials are attached there.
+  const carried = JSON.stringify(backend.init.headers) + JSON.stringify(backend.forwarded.headers);
+  assert.ok(!/authorization|bearer|token/i.test(carried), `the browser sent a credential: ${carried}`);
+  console.log('ok  the browser holds no credential to send');
 
   const elsewhere = [
     'https://evil.example.com/api/things',        // another origin
@@ -157,35 +179,27 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
     'https://app.example.com/',                   // this server
   ];
   for (const url of elsewhere) {
-    const headers = await send(url);
-    assert.strictEqual(headers.token, undefined, `id_token leaked to ${url}`);
-    assert.strictEqual(headers.Authorization, undefined, `backend token leaked to ${url}`);
+    const away = await send(url);
+    assert.notStrictEqual(away.url, '/api/send', `${url} was forwarded with credentials`);
+    assert.strictEqual(away.url, url);
+    assert.deepStrictEqual(away.init.headers, {}, `${url} was sent something of ours`);
   }
-  console.log('ok  no credentials leave for any other origin, path or scheme');
+  console.log('ok  every other origin, path or scheme is sent straight from the browser');
 
-  const typedToken = await send(BACKEND + 'things', [['Token', 'mine-not-yours']]);
-  assert.strictEqual(typedToken.Token, 'mine-not-yours');
-  assert.ok(!('token' in typedToken), 'the id_token was added alongside a header typed by hand');
-  console.log('ok  a token header typed into the form wins');
+  // A header typed into the form is forwarded as typed; the server leaves it alone.
+  const typed = await send(BACKEND + 'things', [['Token', 'mine-not-yours']]);
+  assert.deepStrictEqual(typed.forwarded.headers, { Token: 'mine-not-yours' });
+  console.log('ok  a header typed into the form is forwarded as it was typed');
 
-  const typedAuth = await send(BACKEND + 'things', [['Authorization', 'Basic something']]);
-  assert.strictEqual(typedAuth.Authorization, 'Basic something');
-  assert.strictEqual(typedAuth.token, ID_TOKEN, 'the id_token should be unaffected');
-  console.log('ok  an Authorization header typed into the form wins on its own');
-
-  // What the page shows about those headers.
+  // What the page shows about the headers it is not sending itself.
   await fillIn(BACKEND + 'things');
   const shown = addedRows();
-  assert.deepStrictEqual(shown.map(([name]) => name), ['Authorization', 'token']);
+  assert.deepStrictEqual(shown, [
+    ['Authorization', 'added by this server'],
+    ['token', 'added by this server'],
+  ]);
   assert.ok(!ids['added-headers'].hidden, 'the added rows should be visible');
-  console.log('ok  both added headers are listed');
-
-  const flat = shown.map(([, value]) => value).join(' ');
-  assert.ok(!flat.includes(ID_TOKEN) && !flat.includes('backend-access-token'), `unmasked: ${flat}`);
-  assert.ok(shown.every(([, value]) => value.includes('•')), `not masked: ${flat}`);
-  assert.ok(shown[0][1].startsWith('Bearer •'), `scheme should stay readable: ${shown[0][1]}`);
-  assert.ok(flat.includes(`(${ID_TOKEN.length} characters)`), `length should be shown: ${flat}`);
-  console.log('ok  the values are masked, keeping only the scheme and the length');
+  console.log('ok  both added headers are listed, with no value to show');
 
   await fillIn('https://evil.example.com/api/things');
   assert.deepStrictEqual(addedRows(), [], 'nothing is added for another host');
@@ -195,6 +209,16 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
   await fillIn(BACKEND + 'things', [['token', 'mine-not-yours']]);
   assert.deepStrictEqual(addedRows().map(([name]) => name), ['Authorization']);
   console.log('ok  a header typed into the form drops out of the list');
+
+  // The response panel reports what the server said it did, not what the page assumed.
+  await send(BACKEND + 'things');
+  await settle();
+  const meta = ids['result-meta'].innerHTML;
+  for (const expected of ['sent by this server', 'Authorization added', 'token added']) {
+    assert.ok(meta.includes(expected), `the response panel should say "${expected}": ${meta}`);
+  }
+  assert.ok(ids['result-headers'].textContent.includes('x-from: the backend'), 'headers shown');
+  console.log('ok  the response panel reports what the server attached');
 
   // Last, because replacing the document is one way: the shim has no elements afterwards.
   // A rejection here is the failure -- it is what "Cannot read properties of null" was.

@@ -9,13 +9,16 @@ App registration (Azure portal -> App registrations):
   * Redirect URI of type "Web": http://localhost:3000/oauth2/token
   * Under "Implicit grant and hybrid flows", tick "ID tokens".
 
-No client secret is needed: this uses the implicit id_token flow with
+No client secret is needed for sign-in: this uses the implicit id_token flow with
 response_mode=form_post, so the token arrives in a POST body rather than in a
 URL that would end up in browser history and server logs.
+
+Requests aimed at the backend API are made here rather than by the page, through
+/api/send, so that neither the application's access token nor the visitor's
+id_token is ever served to a browser. See backend.py.
 """
 
 import logging
-import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,9 +26,10 @@ from typing import Annotated
 
 import httpx2
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
+from .backend import ALLOWED_METHODS, BackendProxy, Forwarded, targets_backend
 from .oidc import ClientCredentials, EntraID, IdTokenClaims, TokenError
 from .sessions import PendingLogins, Session, SessionCookie
 from .settings import CALLBACK_PATH, SESSION_COOKIE, env_files_found, settings
@@ -35,8 +39,13 @@ log = logging.getLogger(__name__)
 # Browsers drop a cookie of about 4 KB; warn well before one goes silently missing.
 MAX_COOKIE_BYTES = 3500
 
+# Routes the page calls with fetch. A redirect to Entra is no use to a fetch, so
+# these answer 401 instead -- see `start_sign_in`.
+API_PREFIX = "/api/"
+
 entra = EntraID(settings)
 backend_credentials = ClientCredentials(settings, entra)
+proxy = BackendProxy(settings, backend_credentials)
 pending_logins = PendingLogins(settings.login_ttl)
 sessions = SessionCookie(settings.cookie_secret.get_secret_value(), settings.session_ttl)
 
@@ -71,9 +80,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as error:
             log.warning("could not get a backend access token at startup: %s", error)
     else:
-        log.info("no backend credentials configured; requests are sent unauthenticated")
+        log.info("no backend configured; the page sends every request from the browser")
     yield
     await entra.close()
+    await proxy.close()
 
 
 app = FastAPI(title="Authenticated static server", lifespan=lifespan)
@@ -140,6 +150,13 @@ CurrentUser = Annotated[Session, Depends(current_user)]
 @app.exception_handler(NotAuthenticated)
 async def start_sign_in(request: Request, error: NotAuthenticated) -> Response:
     """Send visitors without a session to Entra ID to sign in."""
+    if request.url.path.startswith(API_PREFIX):
+        # `fetch` would follow a 302 to Microsoft and fail on CORS, leaving the page
+        # with an error that says nothing. This it can read out and show.
+        return JSONResponse(
+            {"detail": "Your session has expired. Reload the page to sign in again."},
+            status_code=401,
+        )
     try:
         state, nonce = pending_logins.start(safe_next(error.next_path))
         return RedirectResponse(await entra.authorization_url(state, nonce), status_code=302)
@@ -230,54 +247,70 @@ async def me(user: CurrentUser) -> IdTokenClaims:
     return user.claims
 
 
-class UserToken(BaseModel):
-    """The visitor's own id_token, and how long it is still valid for."""
+class BackendInfo(BaseModel):
+    """Which URLs the page should hand to this server instead of sending itself."""
 
-    id_token: str
-    expires_in: int
+    enabled: bool
+    url: str
 
 
-@app.get("/oauth2/id-token")
-async def id_token(user: CurrentUser) -> UserToken:
-    """Hand the signed-in visitor back their own id_token.
+@app.get(f"{API_PREFIX}backend")
+async def backend_info(user: CurrentUser) -> BackendInfo:
+    """Where the backend is. Deliberately not a token: the page is given neither.
 
-    A backend token says nothing about who is signed in, so a backend that needs the
-    caller's identity needs this instead. It is the visitor's own token and no one
-    else's, but it is still a bearer assertion of who they are: the page sends it only
-    to `settings.backend_url`, the same rule the backend token follows.
+    Knowing the URL lets the page route those requests through `/api/send` and say
+    so in the interface; it is the same value that is already in `.env`. Half a
+    configuration reports no URL at all, so the page cannot route to a route that
+    would only refuse it.
     """
-    return UserToken(id_token=user.id_token, expires_in=max(1, int(user.claims.exp - time.time())))
+    url = settings.backend_url if settings.backend_enabled else ""
+    return BackendInfo(enabled=settings.backend_enabled, url=url)
 
 
-class BackendToken(BaseModel):
-    """What the page needs in order to call the backend."""
+class SendRequest(BaseModel):
+    """A request the page wants made against the backend."""
 
-    access_token: str
-    expires_in: int
-    backend_url: str
+    method: str = "GET"
+    url: str
+    headers: dict[str, str] = {}
+    body: str | None = None
 
 
-@app.get("/oauth2/backend-token")
-async def backend_token(user: CurrentUser) -> BackendToken:
-    """An access token for the backend API, for the page to send as a Bearer token.
+@app.post(f"{API_PREFIX}send")
+async def send_to_backend(request: SendRequest, user: CurrentUser) -> Forwarded:
+    """Make a request to the backend on behalf of the signed-in visitor.
 
-    Only signed-in visitors get one, and `backend_url` tells the page the single
-    prefix it may send the token to.
+    This is where both credentials are attached, and the only place they exist: the
+    application's access token, and the visitor's own id_token in a `token` header
+    for the backend to validate. Neither is ever handed to a browser.
+
+    `targets_backend` is the security boundary. The tool sends requests to whatever
+    URL is typed into it, so without it this route would forward credentials -- and
+    the server's network position -- to any host a signed-in visitor named.
     """
     if not settings.backend_enabled:
-        raise HTTPException(status_code=404, detail="No backend credentials are configured.")
+        raise HTTPException(status_code=404, detail="No backend is configured on this server.")
+    if request.method.upper() not in ALLOWED_METHODS:
+        raise HTTPException(status_code=400, detail=f"{request.method} is not forwarded.")
+    if not targets_backend(request.url, settings.backend_url):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only requests to {settings.backend_url} are forwarded by this server.",
+        )
+
     try:
-        token = await backend_credentials.access_token()
-    except (httpx2.HTTPError, TokenError) as failure:
+        return await proxy.send(
+            request.method.upper(), request.url, request.headers, request.body, user.id_token
+        )
+    except TokenError as failure:
         # The description names the misconfigured setting, which is for the log,
         # not for the browser.
         log.error("could not get a backend access token: %s", failure)
         raise HTTPException(status_code=503, detail="Could not get a backend access token.") from failure
-    return BackendToken(
-        access_token=token.access_token,
-        expires_in=token.expires_in,
-        backend_url=settings.backend_url,
-    )
+    except httpx2.HTTPError as failure:
+        log.warning("forwarding to %s failed: %s", request.url, failure)
+        detail = f"The backend could not be reached: {failure}"
+        raise HTTPException(status_code=502, detail=detail) from failure
 
 
 @app.get("/{path:path}", include_in_schema=False)

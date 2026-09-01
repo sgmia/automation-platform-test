@@ -35,25 +35,29 @@ Request flow, all of it in [main.py](src/entra_server/main.py):
 2. Entra POSTs the `id_token` back to `/oauth2/token` (`CALLBACK_PATH`), which validates it and sets a
    `session` cookie.
 3. `GET /{path:path}` serves the static site to signed-in visitors.
+4. A request the page wants made against the backend is posted to `POST /api/send` and made *here*,
+   by [backend.py](src/entra_server/backend.py), with both credentials attached. Everything else the
+   page still sends itself with `fetch`.
 
 The module split: [settings.py](src/entra_server/settings.py) (config), [oidc.py](src/entra_server/oidc.py)
 (everything that talks to Entra or validates a token), [sessions.py](src/entra_server/sessions.py)
-(signed session cookies, and pending logins in memory), [main.py](src/entra_server/main.py) (routes).
+(signed session cookies, and pending logins in memory), [backend.py](src/entra_server/backend.py)
+(the URL check and the forwarded request), [main.py](src/entra_server/main.py) (routes).
 
 There are **two Entra identities in play**, and they are unrelated. `EntraID` signs *users* in (public
 client, implicit flow, no secret). `ClientCredentials` gets an access token for the *backend API*
 (confidential client, client credentials flow, its own client id and secret in the same tenant). A
 backend token says nothing about who is signed in — every user gets the same one. Identity is carried
-separately: the page fetches the visitor's `id_token` from `/oauth2/id-token` and sends it to the
-backend in a header named `token`, for the backend to validate itself (audience `client_id`, this app).
-That is not delegated access — a token the backend is the *audience* of would need the on-behalf-of flow.
+separately: the server attaches the visitor's own `id_token`, out of their session cookie, in a header
+named `token`, for the backend to validate itself (audience `client_id`, this app). That is not
+delegated access — a token the backend is the *audience* of would need the on-behalf-of flow.
 
-Because `token` is a custom header, every backend call is preceded by a CORS preflight. **A preflight
-carries no headers and no credentials and cannot be made to** — the browser composes the `OPTIONS`
-itself, so there is no change on this side that authenticates it. A backend that requires auth on
-`OPTIONS` blocks the tool entirely; the fix is always on the backend, and the requirements are written
-down in the README ("What the backend has to allow"). Note that a wildcard in
-`Access-Control-Allow-Headers` is defined not to match `Authorization`, so both headers must be named.
+**Neither token is ever served to a browser.** `/oauth2/id-token` and `/oauth2/backend-token` used to
+hand them out and were removed; `test_the_routes_that_handed_out_tokens_are_gone` fails if either comes
+back. Sending from the server also takes CORS out of the backend path entirely, which is what closed
+the preflight problem: a browser preflight carries no headers and no credentials, the browser composes
+the `OPTIONS` itself, and a backend that requires auth on `OPTIONS` blocks every browser client there
+is. CORS still applies to the requests the page sends direct.
 
 ### The auth design, and why
 
@@ -91,23 +95,34 @@ Two consequences that look like mistakes but aren't:
   must re-validate what is inside through `IdTokenClaims` afterwards. An unset `cookie_secret` means a
   key per process, which is deliberate — it reproduces the old in-memory behaviour of signing everyone
   out on restart rather than falling back to a fixed, guessable key.
-- **The payload holds the `id_token` itself, not a copy of its claims**, because the page needs the
-  token and two copies could disagree. `unverified_claims` reads it back without checking the RS256
-  signature, which is sound *only* for a token that `verify_id_token` accepted before the cookie was
-  signed over it. Never point it at a token that arrived from a browser.
+- **The payload holds the `id_token` itself, not a copy of its claims**, because `/api/send` sends the
+  token on to the backend and two copies could disagree. `unverified_claims` reads it back without
+  checking the RS256 signature, which is sound *only* for a token that `verify_id_token` accepted
+  before the cookie was signed over it. Never point it at a token that arrived from a browser.
 - **Pending logins are a plain dict with no locking**, which is safe only because every handler is
   async on one thread. More than one worker needs a shared store. `ClientCredentials` is the one
   exception: it holds an `asyncio.Lock`, because fetching a token awaits, so concurrent callers *can*
   interleave and each start their own fetch.
-- **Neither token is attached to anything outside `settings.backend_url`** — not the backend token in
-  `Authorization`, and not the visitor's `id_token` in the `token` header. The tool sends requests to
-  whatever URL is typed into it, so sending either unconditionally would hand a credential (an
-  application one, or an assertion of the user's identity) to any host the user names. Both go through
-  the same `targetsBackend()` check, which compares the whole origin and requires a path-segment
-  prefix; `settings.backend_enabled` requires all four `backend_*` settings so the feature cannot come
-  up half-configured with nothing to scope the tokens to.
+- **`targets_backend()` in [backend.py](src/entra_server/backend.py) is a security boundary, not a
+  convenience.** `/api/send` attaches an application credential *and* an assertion of the user's
+  identity, and the tool sends requests to whatever URL is typed into it — so without the check the
+  route is an open proxy that hands both to any host a signed-in visitor names, from wherever the
+  server sits. It compares the whole origin (scheme, host, port, default ports made explicit) and
+  requires a path-segment prefix, so `/apiXX` is not below `/api`. `settings.backend_enabled` requires
+  all four `backend_*` settings so the feature cannot come up half-configured with nothing to scope
+  the tokens to. The page has its own `targetsBackend()`, but only to decide where to send; it is not
+  what enforces anything.
+- **The URL is parsed with `httpx2.URL`, the same library that sends it.** `httpx2` resolves dot
+  segments before the request goes out, so `https://backend/api/../admin` leaves as `/admin` — a check
+  against the raw text would have seen `/api/` and passed it. Anything that re-parses with `urlsplit`
+  or compares strings reopens that. There is a test for exactly this URL.
+- **`follow_redirects=False` on the proxy client.** Following a `Location` would carry the credentials
+  to wherever it pointed, which need not be the backend. Redirects are returned to the page as the
+  response.
 - **New routes must be declared above `static_files`.** FastAPI matches in declaration order, and
-  `GET /{path:path}` swallows everything after it.
+  `GET /{path:path}` swallows everything after it. A route under `API_PREFIX` (`/api/`) is answered
+  with a 401 rather than a 302 when the session is gone, because a `fetch` cannot follow a redirect to
+  Microsoft — see the top of `start_sign_in`.
 
 ### HTTP client
 
@@ -155,9 +170,16 @@ Two things about the `backend` fixture that are easy to break:
 - It replaces `_lock` with a fresh `asyncio.Lock`. The one built at import time binds to the first
   event loop that acquires it, and pytest-asyncio gives each test its own loop.
 
+The `forwarding` fixture (which depends on `backend`) patches `main.proxy._client.request`, records the
+`httpx2.Request`s the server would have sent, and returns a reassignable `handle.reply(request)`. It is
+what makes it testable that a credential went out on *this* request and not on that one; the tests for
+it are in [test_proxy.py](tests/test_proxy.py).
+
 **The page has no Python test at all** — pytest never loads index.html. What covers it is
 [page.js](tests/page.js): `node tests/page.js`, no dependencies and no runner, which runs the real
-script from the HTML against a small DOM shim and asserts on the headers `fetch` was handed. That is
-what proves `targetsBackend()` keeps both the backend token and the `id_token` off every other host.
+script from the HTML against a small DOM shim and asserts on what `fetch` was handed. That is what
+proves the browser holds no credential at all and that only backend URLs go to `/api/send`. Its shim
+models `document.write()` teardown one-way (`document.open()` discards the document, so afterwards
+`getElementById` returns null) — the check for that must stay last, since nothing works after it.
 Run it after touching the script, and extend the shim when the page starts using a DOM feature it does
 not know about. It is not in `uv run pytest`; nothing runs it for you.

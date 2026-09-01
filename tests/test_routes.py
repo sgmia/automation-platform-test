@@ -131,18 +131,14 @@ def test_signed_in_visitor_can_read_their_claims(client, sign_in):
     assert claims["tid"] == settings.tenant_id
 
 
-def test_signed_in_visitor_can_read_the_id_token_they_signed_in_with(client, sign_in):
+def test_the_session_still_carries_the_token_itself(client, sign_in):
+    # No route hands it to a browser any more -- see tests/test_proxy.py -- but the
+    # server needs it to identify the visitor to the backend, so it is in the cookie.
     sign_in()
+    session = main.sessions.read(client.cookies[SESSION_COOKIE])
 
-    body = client.get("/oauth2/id-token").json()
-
-    # The page forwards this to the backend, which validates it for itself.
-    assert unverified_claims(body["id_token"]).preferred_username == "test.user@example.com"
-    assert 0 < body["expires_in"] <= settings.session_ttl
-
-
-def test_the_id_token_is_not_handed_out_without_a_session(client):
-    assert client.get("/oauth2/id-token").status_code == 302
+    assert session is not None
+    assert unverified_claims(session.id_token).preferred_username == "test.user@example.com"
 
 
 @pytest.mark.parametrize("path", ["/server.py", "/pyproject.toml", "/uv.lock", "/../pyproject.toml"])
