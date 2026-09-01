@@ -48,6 +48,13 @@ separately: the page fetches the visitor's `id_token` from `/oauth2/id-token` an
 backend in a header named `token`, for the backend to validate itself (audience `client_id`, this app).
 That is not delegated access — a token the backend is the *audience* of would need the on-behalf-of flow.
 
+Because `token` is a custom header, every backend call is preceded by a CORS preflight. **A preflight
+carries no headers and no credentials and cannot be made to** — the browser composes the `OPTIONS`
+itself, so there is no change on this side that authenticates it. A backend that requires auth on
+`OPTIONS` blocks the tool entirely; the fix is always on the backend, and the requirements are written
+down in the README ("What the backend has to allow"). Note that a wildcard in
+`Access-Control-Allow-Headers` is defined not to match `Authorization`, so both headers must be named.
+
 ### The auth design, and why
 
 This is the **implicit `id_token` flow with `response_mode=form_post`** — not authorization code +

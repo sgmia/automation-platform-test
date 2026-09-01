@@ -118,6 +118,46 @@ tenant's JWKS, issuer, and an audience of `ENTRA_CLIENT_ID` (this app, not the b
 id). It is *not* an access token for the backend API: proper delegated access would be the
 on-behalf-of flow, which exchanges this token for one the backend is the audience of.
 
+### What the backend has to allow (CORS, and the preflight)
+
+The tool sends its requests **from the browser**, so a call to the backend is cross-origin: from
+`ENTRA_BASE_URL` to `ENTRA_BACKEND_URL`. Because those requests carry `Authorization` and a custom
+`token` header, neither of which is CORS-safelisted, the browser sends a **preflight `OPTIONS`** first
+and only makes the real request if it is answered.
+
+**The preflight cannot be authenticated, and it is not a gap that it isn't.** The browser composes it
+itself, and by specification it carries none of the request's headers and no credentials — no
+`Authorization`, no `token`, not even cookies. Nothing the page does can attach anything to it. A
+backend that requires authentication on `OPTIONS` therefore rejects every browser client it has, this
+tool included, and the failure surfaces in the page as an opaque `Request failed` rather than as the
+401 that was actually returned. There is nothing to protect: a preflight response is a handful of
+`Access-Control-*` headers and an empty body.
+
+So the backend must answer `OPTIONS` **before its authentication runs**, with `204` and:
+
+```http
+Access-Control-Allow-Origin: http://localhost:3000
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE
+Access-Control-Allow-Headers: authorization, token, content-type
+Access-Control-Max-Age: 600
+```
+
+and repeat `Access-Control-Allow-Origin` on the real response.
+
+Four things that catch people out:
+
+- **`Access-Control-Allow-Headers: *` does not cover `Authorization`.** The wildcard is defined not to
+  match it; it has to be named. `token` is a custom header and must be named too — it is the one that
+  turns even a plain `GET` into a preflighted request.
+- **`Max-Age` matters.** Without it a preflight goes out ahead of *every* request, doubling the round
+  trips. Browsers cap it (Chrome at 2 hours, Firefox at 24) so a large value is harmless.
+- **`Access-Control-Allow-Origin` must be the origin only** — `http://localhost:3000`, no path, no
+  trailing slash. `*` is also accepted here, because the page does not send credentials cross-origin,
+  but naming the origin is the better default.
+- **Response headers stay invisible unless exposed.** The browser only lets the page read the few
+  safelisted ones, which is why the response panel can say `(no headers exposed by CORS)`. Add
+  `Access-Control-Expose-Headers` naming whatever you want to see.
+
 ## The tool
 
 - **Method, URL and body.** The body is disabled for methods that cannot carry one.
@@ -132,9 +172,12 @@ on-behalf-of flow, which exchanges this token for one the backend is the audienc
   you want to look at returned HTML rather than at its source. Reload to come back; the form is
   restored as you left it.
 
-Requests are sent by the browser with `fetch`, so they carry your cookies for the target origin and are
-subject to CORS. A response from a server that does not send permissive CORS headers will fail — this
-is a browser restriction, not a limitation of the tool.
+Requests are sent by the browser with `fetch`, so they are subject to CORS: a response from a server
+that does not send the right CORS headers will fail, and so will a request whose preflight is refused.
+That is a browser restriction, not a limitation of the tool — see [what the backend has to
+allow](#what-the-backend-has-to-allow-cors-and-the-preflight). `fetch` defaults to
+`credentials: 'same-origin'` and the page does not change it, so your cookies go to this server and
+nowhere else; a cross-origin target gets no cookies, only the headers listed above.
 
 ## Routes
 
@@ -165,7 +208,8 @@ validated before anything is trusted:
 Only then is a session issued, as a `HttpOnly`, `SameSite=Lax` cookie.
 
 The session **is** that cookie: it carries the `id_token` itself and an expiry, signed with HMAC-SHA256
-so it cannot be forged. The claims are read back out of the token rather than stored beside it. Nothing about the session is kept on the server, which has two consequences.
+so it cannot be forged. The claims are read back out of the token rather than stored beside it. Nothing
+about the session is kept on the server, which has two consequences.
 `GET /oauth2/logout` clears the cookie but cannot revoke a copy taken beforehand, and the signing key
 must be stable for a session to survive a restart — set `ENTRA_COOKIE_SECRET` in `.env.local`, or leave
 it unset and each process signs with its own key, ending every session on restart.
