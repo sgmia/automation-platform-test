@@ -43,8 +43,10 @@ The module split: [settings.py](src/entra_server/settings.py) (config), [oidc.py
 There are **two Entra identities in play**, and they are unrelated. `EntraID` signs *users* in (public
 client, implicit flow, no secret). `ClientCredentials` gets an access token for the *backend API*
 (confidential client, client credentials flow, its own client id and secret in the same tenant). A
-backend token says nothing about who is signed in — every user gets the same one. Anything needing
-per-user identity at the backend would need the on-behalf-of flow instead.
+backend token says nothing about who is signed in — every user gets the same one. Identity is carried
+separately: the page fetches the visitor's `id_token` from `/oauth2/id-token` and sends it to the
+backend in a header named `token`, for the backend to validate itself (audience `client_id`, this app).
+That is not delegated access — a token the backend is the *audience* of would need the on-behalf-of flow.
 
 ### The auth design, and why
 
@@ -79,18 +81,24 @@ Two consequences that look like mistakes but aren't:
 - **The session is the cookie.** `SessionCookie` signs `base64(payload).base64(hmac-sha256)` and keeps
   no copy, so there is nothing to revoke: `/oauth2/logout` clears the cookie and a copy taken first
   keeps working until its `exp`. `read()` must verify the signature *before* it parses anything, and
-  must re-validate the claims through `IdTokenClaims` afterwards. An unset `cookie_secret` means a key
-  per process, which is deliberate — it reproduces the old in-memory behaviour of signing everyone out
-  on restart rather than falling back to a fixed, guessable key.
+  must re-validate what is inside through `IdTokenClaims` afterwards. An unset `cookie_secret` means a
+  key per process, which is deliberate — it reproduces the old in-memory behaviour of signing everyone
+  out on restart rather than falling back to a fixed, guessable key.
+- **The payload holds the `id_token` itself, not a copy of its claims**, because the page needs the
+  token and two copies could disagree. `unverified_claims` reads it back without checking the RS256
+  signature, which is sound *only* for a token that `verify_id_token` accepted before the cookie was
+  signed over it. Never point it at a token that arrived from a browser.
 - **Pending logins are a plain dict with no locking**, which is safe only because every handler is
   async on one thread. More than one worker needs a shared store. `ClientCredentials` is the one
   exception: it holds an `asyncio.Lock`, because fetching a token awaits, so concurrent callers *can*
   interleave and each start their own fetch.
-- **The backend token is only attached to URLs under `settings.backend_url`.** The tool sends requests
-  to whatever URL is typed into it, so an unconditional `Authorization` header would hand an
-  application credential to any host the user names. `targetsBackend()` in the page compares the whole
-  origin and requires a path-segment prefix; `settings.backend_enabled` requires all four
-  `backend_*` settings so the feature cannot come up half-configured with nothing to scope the token to.
+- **Neither token is attached to anything outside `settings.backend_url`** — not the backend token in
+  `Authorization`, and not the visitor's `id_token` in the `token` header. The tool sends requests to
+  whatever URL is typed into it, so sending either unconditionally would hand a credential (an
+  application one, or an assertion of the user's identity) to any host the user names. Both go through
+  the same `targetsBackend()` check, which compares the whole origin and requires a path-segment
+  prefix; `settings.backend_enabled` requires all four `backend_*` settings so the feature cannot come
+  up half-configured with nothing to scope the tokens to.
 - **New routes must be declared above `static_files`.** FastAPI matches in declaration order, and
   `GET /{path:path}` swallows everything after it.
 
@@ -140,5 +148,9 @@ Two things about the `backend` fixture that are easy to break:
 - It replaces `_lock` with a fresh `asyncio.Lock`. The one built at import time binds to the first
   event loop that acquires it, and pytest-asyncio gives each test its own loop.
 
-The page's `targetsBackend()` has no Python test. To check it, extract the function from the HTML and
-exercise it under `node`.
+**The page has no Python test at all** — pytest never loads index.html. What covers it is
+[page.js](tests/page.js): `node tests/page.js`, no dependencies and no runner, which runs the real
+script from the HTML against a small DOM shim and asserts on the headers `fetch` was handed. That is
+what proves `targetsBackend()` keeps both the backend token and the `id_token` off every other host.
+Run it after touching the script, and extend the shim when the page starts using a DOM feature it does
+not know about. It is not in `uv run pytest`; nothing runs it for you.

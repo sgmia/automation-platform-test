@@ -5,13 +5,8 @@ import time
 
 import pytest
 
-from entra_server.oidc import IdTokenClaims
 from entra_server.sessions import PendingLogins, SessionCookie, _b64decode, _b64encode
-
-
-def claims(exp=None, **overrides):
-    return IdTokenClaims(sub="u", iat=int(time.time()), exp=int(exp or time.time() + 7200), **overrides)
-
+from tests.helpers import make_id_token
 
 # ---------------------------------------------------------------------------
 # Pending logins
@@ -70,21 +65,25 @@ def repack(sessions, cookie, **changes):
     return f"{edited}.{sessions._sign(edited)}"
 
 
-def test_cookie_returns_the_claims_it_was_minted_from(sessions):
-    cookie, _ = sessions.mint(claims(preferred_username="a@b.c", name="A B"))
-    restored = sessions.read(cookie)
-    assert restored.preferred_username == "a@b.c"
-    assert restored.name == "A B"
+def test_cookie_returns_the_token_and_claims_it_was_minted_from(sessions):
+    token = make_id_token(preferred_username="a@b.c", name="A B")
+    cookie, _ = sessions.mint(token)
+
+    session = sessions.read(cookie)
+
+    assert session.id_token == token  # the page sends this on to the backend
+    assert session.claims.preferred_username == "a@b.c"
+    assert session.claims.name == "A B"
 
 
 def test_claims_the_model_does_not_name_survive_the_round_trip(sessions):
     # IdTokenClaims allows extras, and /oauth2/me hands back whatever Entra sent.
-    cookie, _ = sessions.mint(claims(groups=["one", "two"]))
-    assert sessions.read(cookie).groups == ["one", "two"]
+    cookie, _ = sessions.mint(make_id_token(groups=["one", "two"]))
+    assert sessions.read(cookie).claims.groups == ["one", "two"]
 
 
 def test_cookie_value_is_safe_to_put_in_a_header(sessions):
-    cookie, _ = sessions.mint(claims(name="Zoë; Path=/"))
+    cookie, _ = sessions.mint(make_id_token(name="Zoë; Path=/"))
     assert not set(cookie) & set('; ,"\\')
 
 
@@ -94,48 +93,51 @@ def test_malformed_cookies_are_rejected(sessions, cookie):
 
 
 def test_a_cookie_this_key_did_not_sign_is_rejected(sessions):
-    minted_elsewhere, _ = SessionCookie(secret="another-secret", ttl=3600).mint(claims())
+    minted_elsewhere, _ = SessionCookie(secret="another-secret", ttl=3600).mint(make_id_token())
     assert sessions.read(minted_elsewhere) is None
 
 
-def test_edited_claims_are_rejected(sessions):
-    cookie, _ = sessions.mint(claims(preferred_username="a@b.c"))
+def test_a_swapped_token_is_rejected(sessions):
+    # The signature covers the token, so someone else's cannot be dropped in.
+    cookie, _ = sessions.mint(make_id_token(preferred_username="a@b.c"))
     payload, _, signature = cookie.partition(".")
     body = json.loads(_b64decode(payload))
-    body["claims"]["preferred_username"] = "admin@b.c"
+    body["token"] = make_id_token(preferred_username="admin@b.c")
     forged = f"{_b64encode(json.dumps(body).encode())}.{signature}"
     assert sessions.read(forged) is None
 
 
 def test_expiry_is_not_taken_on_trust(sessions):
     # Signed, so only the expiry itself can reject it.
-    assert sessions.read(repack(sessions, sessions.mint(claims())[0], exp=int(time.time()) - 1)) is None
+    cookie, _ = sessions.mint(make_id_token())
+    assert sessions.read(repack(sessions, cookie, exp=int(time.time()) - 1)) is None
 
 
-def test_a_payload_that_is_not_claims_is_rejected(sessions):
-    cookie, _ = sessions.mint(claims())
-    assert sessions.read(repack(sessions, cookie, claims={"nothing": "useful"})) is None
+def test_a_payload_that_does_not_hold_a_token_is_rejected(sessions):
+    cookie, _ = sessions.mint(make_id_token())
+    assert sessions.read(repack(sessions, cookie, token="not-a-jwt")) is None
 
 
 def test_session_does_not_outlive_the_token(sessions):
-    _, max_age = sessions.mint(claims(exp=time.time() + 30))
+    _, max_age = sessions.mint(make_id_token(exp=int(time.time()) + 30))
     assert max_age <= 30
 
 
 def test_session_is_capped_at_the_configured_ttl(sessions):
-    _, max_age = sessions.mint(claims(exp=time.time() + 10 * 24 * 3600))
+    _, max_age = sessions.mint(make_id_token(exp=int(time.time()) + 10 * 24 * 3600))
     assert max_age == sessions.ttl
 
 
 def test_the_same_secret_reads_cookies_across_instances():
     # What restarting the server with ENTRA_COOKIE_SECRET set has to do.
-    cookie, _ = SessionCookie(secret="shared", ttl=3600).mint(claims(preferred_username="a@b.c"))
-    assert SessionCookie(secret="shared", ttl=3600).read(cookie).preferred_username == "a@b.c"
+    cookie, _ = SessionCookie(secret="shared", ttl=3600).mint(make_id_token(preferred_username="a@b.c"))
+    restored = SessionCookie(secret="shared", ttl=3600).read(cookie)
+    assert restored.claims.preferred_username == "a@b.c"
 
 
 def test_an_unset_secret_gives_each_process_its_own_key():
     first, second = SessionCookie(secret="", ttl=3600), SessionCookie(secret="", ttl=3600)
-    cookie, _ = first.mint(claims())
+    cookie, _ = first.mint(make_id_token())
     assert first.ephemeral and second.ephemeral
     assert first.read(cookie) is not None
     assert second.read(cookie) is None  # a restart signs everyone out

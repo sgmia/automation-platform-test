@@ -15,6 +15,7 @@ URL that would end up in browser history and server logs.
 """
 
 import logging
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,7 +27,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from .oidc import ClientCredentials, EntraID, IdTokenClaims, TokenError
-from .sessions import PendingLogins, SessionCookie
+from .sessions import PendingLogins, Session, SessionCookie
 from .settings import CALLBACK_PATH, SESSION_COOKIE, env_files_found, settings
 
 log = logging.getLogger(__name__)
@@ -120,15 +121,15 @@ def resolve_static_file(path: str) -> Path | None:
 async def current_user(
     request: Request,
     session: Annotated[str | None, Cookie()] = None,
-) -> IdTokenClaims:
+) -> Session:
     """Dependency for anything that requires a signed-in visitor."""
-    claims = sessions.read(session)
-    if claims is None:
+    signed_in = sessions.read(session)
+    if signed_in is None:
         raise NotAuthenticated(next_path=request.url.path)
-    return claims
+    return signed_in
 
 
-CurrentUser = Annotated[IdTokenClaims, Depends(current_user)]
+CurrentUser = Annotated[Session, Depends(current_user)]
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +190,7 @@ async def callback(
         log.exception("could not fetch signing keys")
         return error_page(503, "Sign-in failed", f"Could not validate the id_token: {failure}")
 
-    cookie, max_age = sessions.mint(claims)
+    cookie, max_age = sessions.mint(id_token)
     if len(cookie) > MAX_COOKIE_BYTES:
         # Entra can be configured to emit large claims (a groups claim, most often),
         # and the browser would drop the cookie without saying so.
@@ -226,7 +227,26 @@ async def logout() -> Response:
 @app.get("/oauth2/me")
 async def me(user: CurrentUser) -> IdTokenClaims:
     """The claims of the validated id_token this session was created from."""
-    return user
+    return user.claims
+
+
+class UserToken(BaseModel):
+    """The visitor's own id_token, and how long it is still valid for."""
+
+    id_token: str
+    expires_in: int
+
+
+@app.get("/oauth2/id-token")
+async def id_token(user: CurrentUser) -> UserToken:
+    """Hand the signed-in visitor back their own id_token.
+
+    A backend token says nothing about who is signed in, so a backend that needs the
+    caller's identity needs this instead. It is the visitor's own token and no one
+    else's, but it is still a bearer assertion of who they are: the page sends it only
+    to `settings.backend_url`, the same rule the backend token follows.
+    """
+    return UserToken(id_token=user.id_token, expires_in=max(1, int(user.claims.exp - time.time())))
 
 
 class BackendToken(BaseModel):

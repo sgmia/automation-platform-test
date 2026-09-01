@@ -4,7 +4,7 @@
 request handler is async on one thread. Its entries are lost on restart, which is
 fine for a single process but would need a shared store behind more than one worker.
 
-Sessions themselves are kept nowhere: the claims ride in a cookie the visitor
+Sessions themselves are kept nowhere: the id_token rides in a cookie the visitor
 carries, signed so it cannot be forged.
 """
 
@@ -15,7 +15,9 @@ import json
 import secrets
 import time
 
-from .oidc import IdTokenClaims
+from pydantic import BaseModel
+
+from .oidc import IdTokenClaims, TokenError, unverified_claims
 
 
 class PendingLogins:
@@ -58,14 +60,21 @@ def _b64decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
+class Session(BaseModel):
+    """A signed-in visitor: their id_token, and the claims it carries."""
+
+    id_token: str
+    claims: IdTokenClaims
+
+
 class SessionCookie:
     """The session, carried by the visitor in a signed cookie instead of held here.
 
-    The value is `payload.signature`, both base64url: the payload is the claims plus
-    an expiry, the signature is HMAC-SHA256 over the encoded payload. Nothing is
-    encrypted -- these are the visitor's own id_token claims, which they can read out
-    of the token anyway -- so the signature is only there to make the cookie
-    unforgeable.
+    The value is `payload.signature`, both base64url: the payload is the id_token plus
+    an expiry, the signature is HMAC-SHA256 over the encoded payload. The claims are
+    not stored alongside it -- they are *in* the token, so keeping a second copy would
+    only be a way for the two to disagree. Nothing is encrypted, because the token is
+    the visitor's own; the signature is there to make the cookie unforgeable.
 
     Holding no server-side copy has two consequences worth knowing:
 
@@ -82,19 +91,23 @@ class SessionCookie:
         self.ephemeral = not secret
         self._key = (secret or secrets.token_urlsafe(32)).encode()
 
-    def mint(self, claims: IdTokenClaims) -> tuple[str, int]:
-        """Build the cookie value for these claims, and how long it is good for."""
+    def mint(self, id_token: str) -> tuple[str, int]:
+        """Build the cookie value for a validated id_token, and how long it is good for.
+
+        The caller must have run the token through `verify_id_token` first: reading its
+        claims here does not check the signature.
+        """
         # A session never outlives the token it was minted from.
-        max_age = max(1, min(self.ttl, int(claims.exp - time.time())))
-        body = {"exp": int(time.time()) + max_age, "claims": claims.model_dump(mode="json")}
+        max_age = max(1, min(self.ttl, int(unverified_claims(id_token).exp - time.time())))
+        body = {"exp": int(time.time()) + max_age, "token": id_token}
         payload = _b64encode(json.dumps(body, separators=(",", ":")).encode())
         return f"{payload}.{self._sign(payload)}", max_age
 
-    def read(self, cookie: str | None) -> IdTokenClaims | None:
-        """The claims of a valid, unexpired cookie; None for anything else.
+    def read(self, cookie: str | None) -> Session | None:
+        """The session a valid, unexpired cookie stands for; None for anything else.
 
-        Nothing in the cookie is trusted before the signature is checked, and the
-        claims are re-validated afterwards in case an older version wrote them.
+        Nothing in the cookie is trusted before the signature is checked, and the token
+        inside is re-read afterwards in case an older version wrote something else.
         """
         payload, _, signature = (cookie or "").partition(".")
         if not signature or not hmac.compare_digest(signature, self._sign(payload)):
@@ -103,8 +116,10 @@ class SessionCookie:
             body = json.loads(_b64decode(payload))
             if body["exp"] <= time.time():
                 return None
-            return IdTokenClaims.model_validate(body["claims"])
-        except (ValueError, KeyError, TypeError):  # pydantic's ValidationError is a ValueError
+            return Session(id_token=body["token"], claims=unverified_claims(body["token"]))
+        # pydantic's ValidationError is a ValueError; TokenError is what a payload that
+        # is signed but does not hold a JWT comes back as.
+        except (ValueError, KeyError, TypeError, TokenError):
             return None
 
     def _sign(self, payload: str) -> str:

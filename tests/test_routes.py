@@ -6,6 +6,7 @@ import pytest
 
 from entra_server import main
 from entra_server.main import resolve_static_file, safe_next
+from entra_server.oidc import unverified_claims
 from entra_server.sessions import SessionCookie
 from entra_server.settings import CALLBACK_PATH, SESSION_COOKIE, settings
 from tests.helpers import make_id_token
@@ -128,6 +129,20 @@ def test_signed_in_visitor_can_read_their_claims(client, sign_in):
     claims = client.get("/oauth2/me").json()
     assert claims["preferred_username"] == "test.user@example.com"
     assert claims["tid"] == settings.tenant_id
+
+
+def test_signed_in_visitor_can_read_the_id_token_they_signed_in_with(client, sign_in):
+    sign_in()
+
+    body = client.get("/oauth2/id-token").json()
+
+    # The page forwards this to the backend, which validates it for itself.
+    assert unverified_claims(body["id_token"]).preferred_username == "test.user@example.com"
+    assert 0 < body["expires_in"] <= settings.session_ttl
+
+
+def test_the_id_token_is_not_handed_out_without_a_session(client):
+    assert client.get("/oauth2/id-token").status_code == 302
 
 
 @pytest.mark.parametrize("path", ["/server.py", "/pyproject.toml", "/uv.lock", "/../pyproject.toml"])

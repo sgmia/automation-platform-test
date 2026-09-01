@@ -8,7 +8,7 @@ from unittest import mock
 import pytest
 from cryptography.hazmat.primitives import serialization
 
-from entra_server.oidc import EntraID, TokenError
+from entra_server.oidc import EntraID, TokenError, unverified_claims
 from entra_server.settings import settings
 from tests.helpers import (
     FOREIGN_KEY,
@@ -138,6 +138,30 @@ async def test_algorithm_confusion_is_rejected(entra):
     mac = hmac.new(public_pem, signing_input(unsigned), hashlib.sha256).digest()
     token = f"{signing_input(unsigned).decode()}.{b64(mac).decode()}"
     await assert_rejected(entra, token, "alg value is not allowed")
+
+
+# ---------------------------------------------------------------------------
+# Re-reading a token that was validated when it arrived
+# ---------------------------------------------------------------------------
+
+
+def test_unverified_claims_reads_a_token_without_checking_its_signature():
+    # Deliberate, and the reason its one caller is the session cookie: that token
+    # was validated at sign-in, and the cookie's own signature vouches for it since.
+    token = make_id_token(key=FOREIGN_KEY, preferred_username="a@b.c")
+    assert unverified_claims(token).preferred_username == "a@b.c"
+
+
+@pytest.mark.parametrize("value", ["", "not-a-jwt", "a.b.c"])
+def test_unverified_claims_still_refuses_what_is_not_a_token(value):
+    with pytest.raises(TokenError):
+        unverified_claims(value)
+
+
+def test_unverified_claims_requires_the_claims_it_is_typed_for():
+    # No sub, so IdTokenClaims cannot be built and the session cannot be read back.
+    with pytest.raises(ValueError):
+        unverified_claims(make_id_token(sub=None))
 
 
 # ---------------------------------------------------------------------------

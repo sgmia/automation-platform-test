@@ -102,15 +102,32 @@ does not match `/api`. A note under the URL field says which case applies, and a
 header you add by hand always wins.
 
 Note that this token authenticates the *application*, not the signed-in user: everyone who can sign in
-gets the same one, with the same permissions. If the backend needs to know who is calling, this flow is
-the wrong one — you want the on-behalf-of flow instead.
+gets the same one, with the same permissions.
+
+So that a backend can tell **who** is calling, the page also sends the signed-in visitor's `id_token`
+in a header named `token`, next to the `Authorization` header, and the response panel says `id_token
+sent` when it did. It comes from `GET /oauth2/id-token`, which hands a visitor their own token and no
+one else's, out of the session cookie.
+
+**The `token` header follows the same rule as the bearer token: `ENTRA_BACKEND_URL` only.** It is a
+bearer assertion of the user's identity, so a host you typed into the tool must never receive it. A
+`token` header you add by hand wins, as with `Authorization`.
+
+The backend should validate that `id_token` as a token in its own right — signature against the
+tenant's JWKS, issuer, and an audience of `ENTRA_CLIENT_ID` (this app, not the backend's own client
+id). It is *not* an access token for the backend API: proper delegated access would be the
+on-behalf-of flow, which exchanges this token for one the backend is the audience of.
 
 ## The tool
 
 - **Method, URL and body.** The body is disabled for methods that cannot carry one.
 - **URL parameters** as name/value rows, with a live preview of the assembled request URL and an
   **Extract from URL** button that pulls an existing query string apart into rows.
-- **Headers** as name/value rows.
+- **Headers** as name/value rows, with the ones the page adds for the backend — `Authorization` and
+  `token` — listed below them as disabled rows. Their values are masked (`Bearer •••••••••••••••• (1462
+  characters)`): the point is to show *that* a credential is attached and how big it is, without
+  putting it on screen for a screenshot or a shoulder to catch. They are sent in full. A header you
+  type yourself wins and drops the matching row from the list.
 - **Replace this page with the response** — renders the response body as the entire document, for when
   you want to look at returned HTML rather than at its source. Reload to come back; the form is
   restored as you left it.
@@ -128,6 +145,7 @@ is a browser restriction, not a limitation of the tool.
 | `POST /oauth2/token` | Where Entra ID posts the `id_token`. |
 | `GET /oauth2/logout` | Clear the session cookie. |
 | `GET /oauth2/me` | The claims of the validated token this session came from. |
+| `GET /oauth2/id-token` | The visitor's own `id_token`, for the page to send to the backend. Requires a session. |
 | `GET /oauth2/backend-token` | A backend access token for the page. Requires a session; 404 when no backend is configured. |
 
 ## How sign-in works
@@ -146,8 +164,8 @@ validated before anything is trusted:
 
 Only then is a session issued, as a `HttpOnly`, `SameSite=Lax` cookie.
 
-The session **is** that cookie: it carries the token's claims and an expiry, signed with HMAC-SHA256 so
-it cannot be forged. Nothing about the session is kept on the server, which has two consequences.
+The session **is** that cookie: it carries the `id_token` itself and an expiry, signed with HMAC-SHA256
+so it cannot be forged. The claims are read back out of the token rather than stored beside it. Nothing about the session is kept on the server, which has two consequences.
 `GET /oauth2/logout` clears the cookie but cannot revoke a copy taken beforehand, and the signing key
 must be stable for a session to survive a restart — set `ENTRA_COOKIE_SECRET` in `.env.local`, or leave
 it unset and each process signs with its own key, ending every session on restart.
@@ -162,6 +180,7 @@ the project's own sources are unreachable.
 uv run pytest
 uv run pytest -k nonce        # by name
 uv run ruff check .           # lint
+node tests/page.js            # the page's send path, outside pytest
 ```
 
 The tests stub Entra ID's endpoints in memory and mint their own tokens with throwaway RSA keys, so the
@@ -180,4 +199,5 @@ src/entra_server/
   settings.py   configuration
   static/       the web page
 tests/
+  page.js       the page's send path, run with node rather than pytest
 ```

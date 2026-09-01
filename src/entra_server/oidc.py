@@ -31,6 +31,20 @@ class IdTokenClaims(BaseModel):
     nonce: str | None = None
 
 
+def unverified_claims(id_token: str) -> IdTokenClaims:
+    """Read the claims of a token that was already validated when it arrived.
+
+    The signature check is skipped deliberately, and this is only safe for that one
+    case: the token came back out of a cookie this server signed, having passed
+    `verify_id_token` before it went in. Anything arriving from a browser, a header
+    or a form must go through `verify_id_token` instead.
+    """
+    try:
+        return IdTokenClaims.model_validate(jwt.decode(id_token, options={"verify_signature": False}))
+    except jwt.PyJWTError as error:
+        raise TokenError(str(error)) from error
+
+
 class EntraID:
     """The tenant's OpenID Connect endpoints, plus the validation of what they issue."""
 

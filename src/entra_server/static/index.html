@@ -98,6 +98,9 @@
   }
   label.check input { margin: 0; accent-color: var(--accent); }
   label.check .note { margin: 0; }
+  #added-headers { margin-top: 8px; }
+  #added-headers .note { margin: 0 0 8px; }
+  #added-headers input { color: var(--muted); cursor: default; }
   .hide { display: none; }
 </style>
 </head>
@@ -149,6 +152,10 @@
         <button type="button" id="add-header">+ Add header</button>
       </div>
       <div id="headers"></div>
+      <div id="added-headers" class="hide">
+        <p class="note">Added automatically for the backend. The values are masked; they are sent in full.</p>
+        <div id="added-header-rows"></div>
+      </div>
     </section>
 
     <section>
@@ -181,6 +188,8 @@
 const $ = (id) => document.getElementById(id);
 const headersEl = $('headers');
 const paramsEl = $('params');
+const addedHeadersEl = $('added-headers');
+const addedRowsEl = $('added-header-rows');
 
 function addRow(container, placeholder, name = '', value = '') {
   const row = document.createElement('div');
@@ -265,6 +274,44 @@ function backendToken() {
   return backendInFlight;
 }
 
+// ---------------------------------------------------------------------------
+// The visitor's own id_token
+//
+// The backend token above says which application is calling, never which person.
+// A backend that needs to know who is signed in gets the id_token instead, in a
+// `token` header -- and under exactly the same scope rule, because it is a bearer
+// assertion of the user's identity and must not reach a host they typed in.
+// ---------------------------------------------------------------------------
+const identity = { token: null, expiresAt: 0, error: '' };
+let identityInFlight = null;
+
+async function fetchIdToken() {
+  const response = await fetch('/oauth2/id-token', { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+
+  const data = await response.json();
+  identity.token = data.id_token;
+  // It comes out of the session cookie, so it expires with the session.
+  identity.expiresAt = performance.now() + Math.max(1, data.expires_in - 30) * 1000;
+  identity.error = '';
+  return identity.token;
+}
+
+// Cached and de-duplicated, as the backend token is.
+function idToken() {
+  if (identity.token && performance.now() < identity.expiresAt) return Promise.resolve(identity.token);
+  if (!identityInFlight) {
+    identityInFlight = fetchIdToken()
+      .catch((error) => {
+        identity.token = null;
+        identity.error = String(error);
+        return null;
+      })
+      .finally(() => { identityInFlight = null; });
+  }
+  return identityInFlight;
+}
+
 // True only for URLs at or below the backend prefix, so a token is never sent
 // to another origin -- or to a lookalike path like /apiXX next to /api.
 function targetsBackend(requestUrl) {
@@ -284,18 +331,59 @@ function targetsBackend(requestUrl) {
 const hasHeader = (headers, name) =>
   Object.keys(headers).some((key) => key.toLowerCase() === name);
 
+// Enough to see that a credential is attached, and its size, without putting it on
+// screen -- where it could be read over a shoulder or captured in a screenshot.
+const mask = (secret) => `${'•'.repeat(16)} (${secret.length} characters)`;
+
+// The headers the page adds by itself, shown as disabled rows under the ones typed in,
+// so what actually leaves the browser is visible rather than implied by a note.
+function showAddedHeaders(added) {
+  addedHeadersEl.classList.toggle('hide', !added.length);
+  addedRowsEl.replaceChildren();
+
+  for (const [name, value] of added) {
+    const row = document.createElement('div');
+    row.className = 'kv row';
+    row.innerHTML = `
+      <input type="text" disabled>
+      <input type="text" disabled>
+      <button type="button" class="icon" tabindex="-1" aria-hidden="true">&times;</button>`;
+    const [nameInput, valueInput] = row.querySelectorAll('input');
+    nameInput.value = name;
+    valueInput.value = value;
+    // Not a control, only there to keep the columns lined up with the rows above.
+    row.querySelector('button').style.visibility = 'hidden';
+    addedRowsEl.appendChild(row);
+  }
+}
+
 async function updateAuthNote() {
   const note = $('auth-note');
   const token = await backendToken();
   const matches = targetsBackend(buildUrl());
+  const signedIn = matches ? await idToken() : null;
 
+  // Exactly the headers the submit handler will add, under the same conditions -- a
+  // header typed into the form wins, so it is not listed as added either.
+  const typed = collectHeaders();
+  const added = [];
+  if (token && matches && !hasHeader(typed, 'authorization')) {
+    added.push(['Authorization', `Bearer ${mask(token.token)}`]);
+  }
+  if (signedIn && !hasHeader(typed, 'token')) {
+    added.push(['token', mask(signedIn)]);
+  }
+  showAddedHeaders(added);
+
+  // With the rows above showing what is attached, the note is only for the cases where
+  // nothing is: a token that could not be fetched, or a URL somewhere else entirely.
   let text = '';
   if (backend.error && matches) {
     text = `Backend token unavailable (${backend.error}). Reload if your sign-in has expired.`;
-  } else if (token && matches) {
-    text = 'Authorization: Bearer … will be added for the backend.';
-  } else if (token) {
-    text = `A backend token is available, but it is only sent to ${backend.url}`;
+  } else if (token && matches && !signedIn) {
+    text = 'Your id_token is unavailable, so only the backend token will be added.';
+  } else if (token && !matches) {
+    text = `A backend token and your id_token are available, but they are only sent to ${backend.url}`;
   }
 
   note.textContent = text;
@@ -465,6 +553,8 @@ $('extract-params').addEventListener('click', extractParams);
 $('method').addEventListener('change', updateBodyState);
 $('url').addEventListener('input', updatePreview);
 paramsEl.addEventListener('input', updatePreview);
+// Typing an Authorization or token header of your own removes it from the added rows.
+headersEl.addEventListener('input', updateAuthNote);
 
 // One pair of listeners on the form covers every field, including rows added later. `change`
 // catches the method select and the checkbox on browsers that do not fire `input` for them.
@@ -482,9 +572,14 @@ $('form').addEventListener('submit', async (event) => {
   const headers = collectHeaders();
   // Fetch first, then test the URL: on the very first send `backend.url` is only
   // known once the token has arrived. A header typed into the form always wins.
-  const token = hasHeader(headers, 'authorization') ? null : await backendToken();
-  const authenticated = Boolean(token) && targetsBackend(url);
+  const token = await backendToken();
+  const forBackend = targetsBackend(url);
+  const authenticated = Boolean(token) && forBackend && !hasHeader(headers, 'authorization');
   if (authenticated) headers.Authorization = `Bearer ${token.token}`;
+
+  // Who is calling, alongside which application is calling.
+  const identified = forBackend && !hasHeader(headers, 'token') && Boolean(await idToken());
+  if (identified) headers.token = identity.token;
 
   const init = { method, headers };
   if (!['GET', 'HEAD'].includes(method) && body !== '') init.body = body;
@@ -513,7 +608,8 @@ $('form').addEventListener('submit', async (event) => {
       <span class="${statusClass}">${response.status} ${escapeHtml(response.statusText)}</span>
       <span>${elapsed} ms</span>
       <span>${text.length} bytes</span>
-      ${authenticated ? '<span>Bearer token sent</span>' : ''}`;
+      ${authenticated ? '<span>Bearer token sent</span>' : ''}
+      ${identified ? '<span>id_token sent</span>' : ''}`;
 
     const responseHeaders = [...response.headers.entries()]
       .map(([name, value]) => `${name}: ${value}`)
@@ -532,6 +628,9 @@ $('form').addEventListener('submit', async (event) => {
   } finally {
     sendButton.disabled = false;
     sendButton.textContent = 'Send';
+    // The first send is what fetches the tokens, so the rows above only become
+    // accurate once it has happened.
+    updateAuthNote();
   }
 });
 
