@@ -68,12 +68,18 @@ for (const id of ['method', 'url', 'body', 'replace-page', 'send', 'form', 'head
   ids[id] = new El('div');
 }
 
+// document.open() discards the current document. Everything the page held on to is then
+// detached, and getElementById finds only what was written in its place -- which is what
+// makes a handler that runs afterwards reach for a form that is not there.
+let replaced = false;
+const backButton = new El('button');
+
 global.document = {
-  getElementById: (id) => ids[id],
+  getElementById: (id) => (replaced ? (id === '__back' ? backButton : null) : ids[id]),
   createElement: (tag) => new El(tag),
   baseURI: 'https://app.example.com/',
   cookie: '',
-  open() {}, write() {}, close() {},
+  open() { replaced = true; }, write() {}, close() {},
 };
 global.location = { protocol: 'https:', reload() {} };
 global.performance = { now: () => Date.now() };
@@ -189,4 +195,12 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
   await fillIn(BACKEND + 'things', [['token', 'mine-not-yours']]);
   assert.deepStrictEqual(addedRows().map(([name]) => name), ['Authorization']);
   console.log('ok  a header typed into the form drops out of the list');
+
+  // Last, because replacing the document is one way: the shim has no elements afterwards.
+  // A rejection here is the failure -- it is what "Cannot read properties of null" was.
+  ids['replace-page'].checked = true;
+  await send(BACKEND + 'things');
+  await settle();
+  assert.ok(replaced, 'the response should have replaced the document');
+  console.log('ok  replacing the page leaves nothing reaching for the removed form');
 })();

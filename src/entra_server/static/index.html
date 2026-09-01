@@ -358,10 +358,15 @@ function showAddedHeaders(added) {
 }
 
 async function updateAuthNote() {
-  const note = $('auth-note');
+  // Read the URL before awaiting anything, so what is shown belongs to the URL as it
+  // was when the note was asked for.
+  const url = buildUrl();
   const token = await backendToken();
-  const matches = targetsBackend(buildUrl());
+  const matches = targetsBackend(url);
   const signedIn = matches ? await idToken() : null;
+  // "Replace this page" can land while those fetches are in flight, and it takes the
+  // form -- every element touched below -- out of the document.
+  if (pageReplaced) return;
 
   // Exactly the headers the submit handler will add, under the same conditions -- a
   // header typed into the form wins, so it is not listed as added either.
@@ -377,6 +382,7 @@ async function updateAuthNote() {
 
   // With the rows above showing what is attached, the note is only for the cases where
   // nothing is: a token that could not be fetched, or a URL somewhere else entirely.
+  const note = $('auth-note');
   let text = '';
   if (backend.error && matches) {
     text = `Backend token unavailable (${backend.error}). Reload if your sign-in has expired.`;
@@ -514,10 +520,16 @@ function restoreState() {
   return true;
 }
 
+// Set once the document has been replaced by a response. This script keeps running, and
+// anything of it still queued -- a pending updateAuthNote(), the submit handler's cleanup
+// -- would be reaching for elements that no longer exist. One way: only a reload returns.
+let pageReplaced = false;
+
 // Replaces the entire document with the response. HTML is rendered as HTML — note that any
 // scripts it contains then run with this page's origin — anything else is shown as text.
 function replacePageWith(text, url, contentType) {
   saveState();
+  pageReplaced = true;
 
   const bar =
     '<div style="position:sticky;top:0;display:flex;gap:12px;align-items:center;' +
@@ -626,11 +638,15 @@ $('form').addEventListener('submit', async (event) => {
     $('result-body').textContent =
       `${error}\n\nCommon causes: invalid URL, network failure, or the response was blocked by CORS.`;
   } finally {
-    sendButton.disabled = false;
-    sendButton.textContent = 'Send';
-    // The first send is what fetches the tokens, so the rows above only become
-    // accurate once it has happened.
-    updateAuthNote();
+    // `finally` runs even where the response replaced the document, and then there is no
+    // button to re-enable and no rows to redraw -- only elements document.write() removed.
+    if (!pageReplaced) {
+      sendButton.disabled = false;
+      sendButton.textContent = 'Send';
+      // The first send is what fetches the tokens, so the rows above only become
+      // accurate once it has happened.
+      updateAuthNote();
+    }
   }
 });
 
