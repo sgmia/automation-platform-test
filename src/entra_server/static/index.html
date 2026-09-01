@@ -242,6 +242,8 @@ function collectHeaders() {
 // All this fetches is where the backend is, which is what decides whether a URL
 // goes through the server or straight out of the browser.
 // ---------------------------------------------------------------------------
+// These two paths are the server's ENTRA_API_PREFIX, which is configurable; nothing
+// reads it for us, so changing that setting means changing them here too.
 const backend = { url: '', enabled: false, loaded: false, error: '' };
 let backendInFlight = null;
 

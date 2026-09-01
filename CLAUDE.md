@@ -32,8 +32,8 @@ Request flow, all of it in [main.py](src/entra_server/main.py):
 1. Any unauthenticated request raises `NotAuthenticated`, which an `@app.exception_handler` turns into
    a 302 to Entra's authorization endpoint. Auth is enforced by the `CurrentUser` dependency, so a new
    route is protected by declaring `user: CurrentUser` and unprotected by omitting it.
-2. Entra POSTs the `id_token` back to `/oauth2/token` (`CALLBACK_PATH`), which validates it and sets a
-   `session` cookie.
+2. Entra POSTs the `id_token` back to `/oauth2/token` (`settings.callback_path`), which validates it
+   and sets a `session` (`settings.session_cookie`) cookie.
 3. `GET /{path:path}` serves the static site to signed-in visitors.
 4. A request the page wants made against the backend is posted to `POST /api/send` and made *here*,
    by [backend.py](src/entra_server/backend.py), with both credentials attached. Everything else the
@@ -72,7 +72,7 @@ Two consequences that look like mistakes but aren't:
   sessions moved into a cookie. The callback is a cross-site POST, so a `SameSite=Lax` cookie is not
   sent with it. A cookie-based state check would simply never match, and `SameSite=None` would require
   https, which the default `http://localhost:3000` is not.
-- **`CALLBACK_PATH` has an explicit `GET` handler returning 405.** Without it, a stray GET falls
+- **The callback path has an explicit `GET` handler returning 405.** Without it, a stray GET falls
   through to the static catch-all, because Starlette prefers a fully matching route over a method
   match. Deleting it silently reopens that hole.
 
@@ -120,9 +120,9 @@ Two consequences that look like mistakes but aren't:
   to wherever it pointed, which need not be the backend. Redirects are returned to the page as the
   response.
 - **New routes must be declared above `static_files`.** FastAPI matches in declaration order, and
-  `GET /{path:path}` swallows everything after it. A route under `API_PREFIX` (`/api/`) is answered
-  with a 401 rather than a 302 when the session is gone, because a `fetch` cannot follow a redirect to
-  Microsoft — see the top of `start_sign_in`.
+  `GET /{path:path}` swallows everything after it. A route under `settings.api_prefix` (`/api/`) is
+  answered with a 401 rather than a 302 when the session is gone, because a `fetch` cannot follow a
+  redirect to Microsoft — see the top of `start_sign_in`.
 
 ### HTTP client
 
@@ -146,6 +146,16 @@ naming the directory it searched. It re-raises anything that isn't a missing fie
 
 `base_url` drives both `redirect_uri` and whether the session cookie is marked `Secure`, so changing it
 to an `https://` URL requires adding the matching redirect URI to the app registration.
+
+`callback_path`, `api_prefix` and `session_cookie` are settings too, but they are read at **import
+time** — the route decorators and the `Cookie(alias=...)` in `current_user` are evaluated when
+`main.py` is loaded, so `monkeypatch.setattr(settings, "api_prefix", ...)` in a test changes nothing
+about the routes that already exist. Both paths are normalised by a validator (slashes supplied, the
+site root refused), so `ENTRA_API_PREFIX=api` and `/api/` mean the same thing. Two couplings that are
+not enforced anywhere: `ENTRA_CALLBACK_PATH` must match a redirect URI on the app registration, and
+`ENTRA_API_PREFIX` must match the `/api/backend` and `/api/send` paths hardcoded in
+[index.html](src/entra_server/static/index.html) — the page is served as a static file and cannot read
+the setting.
 
 ## Tests
 

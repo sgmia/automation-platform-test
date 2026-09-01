@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from entra_server import main
-from entra_server.settings import CALLBACK_PATH, settings
+from entra_server.settings import settings
 from tests.helpers import ISSUER, KID, SIGNING_KEY, jwks, make_id_token
 
 TOKEN_ENDPOINT = "https://stub.invalid/oauth2/v2.0/token"
@@ -153,7 +153,8 @@ def sign_in(client):
         assert response.status_code == 302
         state = next(iter(main.pending_logins._pending))
         nonce = main.pending_logins._pending[state][0]
-        callback = client.post(CALLBACK_PATH, data={"id_token": make_id_token(nonce=nonce), "state": state})
+        form = {"id_token": make_id_token(nonce=nonce), "state": state}
+        callback = client.post(settings.callback_path, data=form)
         assert callback.status_code == 303
         return callback
 

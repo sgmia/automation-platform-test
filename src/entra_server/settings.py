@@ -8,14 +8,24 @@ secrets and personal overrides and is not.
 
 from pathlib import Path
 
-from pydantic import SecretStr, ValidationError
+from pydantic import SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-CALLBACK_PATH = "/oauth2/token"  # must match the redirect URI on the app registration
-SESSION_COOKIE = "session"
 
 # Read in order, so a value in .env.local wins over the same value in .env.
 ENV_FILES = (".env", ".env.local")
+
+
+def _path_body(value: str) -> str:
+    """The inside of a configured path, with the slashes at either end taken off.
+
+    The site root is refused. As a route it shadows the static site, and as a prefix
+    it covers every request there is -- which would answer every expired session with
+    a 401 instead of a redirect to Entra ID, and leave the page with nothing to load.
+    """
+    body = value.strip().strip("/")
+    if not body:
+        raise ValueError("must name a path below the site root, such as /api")
+    return body
 
 
 def env_files_found() -> list[Path]:
@@ -37,6 +47,20 @@ class Settings(BaseSettings):
     client_id: str
 
     base_url: str = "http://localhost:3000"
+
+    # Where Entra ID posts the id_token back to. It ends up in `redirect_uri`, so it
+    # must match the redirect URI registered on the app registration.
+    callback_path: str = "/oauth2/token"
+
+    # The prefix the page's own fetch routes live under. A request below it is
+    # answered 401 rather than redirected to Entra, because a fetch cannot follow a
+    # redirect to Microsoft. Changing it means changing the paths in static/index.html
+    # to match -- the page is a static file and cannot read this.
+    api_prefix: str = "/api/"
+
+    # The name of the signed session cookie. Renaming it signs everyone out, since the
+    # cookie the browser is already holding is no longer looked for.
+    session_cookie: str = "session"
 
     # Only this directory is ever served, so the project's own files stay private.
     static_dir: Path = Path(__file__).parent / "static"
@@ -63,6 +87,22 @@ class Settings(BaseSettings):
     # a default, and an API can be slower to answer than Entra ID is.
     backend_timeout: float = 30.0
 
+    @field_validator("callback_path")
+    @classmethod
+    def _absolute_path(cls, value: str) -> str:
+        """A route path, leading slash and no trailing one: `/oauth2/token`."""
+        return f"/{_path_body(value)}"
+
+    @field_validator("api_prefix")
+    @classmethod
+    def _path_prefix(cls, value: str) -> str:
+        """A prefix with slashes at both ends, so `f"{api_prefix}send"` is a path.
+
+        It is matched with `startswith`, so the trailing slash is what keeps `/apix`
+        from counting as being below `/api`.
+        """
+        return f"/{_path_body(value)}/"
+
     @property
     def issuer(self) -> str:
         """The only issuer we accept tokens from. Single tenant, so it is fixed."""
@@ -74,7 +114,7 @@ class Settings(BaseSettings):
 
     @property
     def redirect_uri(self) -> str:
-        return f"{self.base_url.rstrip('/')}{CALLBACK_PATH}"
+        return f"{self.base_url.rstrip('/')}{self.callback_path}"
 
     @property
     def static_root(self) -> Path:

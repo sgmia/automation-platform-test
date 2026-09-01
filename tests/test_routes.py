@@ -8,7 +8,7 @@ from entra_server import main
 from entra_server.main import resolve_static_file, safe_next
 from entra_server.oidc import unverified_claims
 from entra_server.sessions import SessionCookie
-from entra_server.settings import CALLBACK_PATH, SESSION_COOKIE, settings
+from entra_server.settings import settings
 from tests.helpers import make_id_token
 
 
@@ -36,7 +36,7 @@ def test_unauthenticated_visitor_is_sent_to_entra(client):
 
 
 def test_callback_does_not_answer_get(client):
-    assert client.get(CALLBACK_PATH).status_code == 405
+    assert client.get(settings.callback_path).status_code == 405
 
 
 def test_claims_endpoint_requires_a_session(client):
@@ -74,7 +74,7 @@ def test_callback_returns_the_visitor_to_the_page_they_asked_for(client, sign_in
 
 
 def test_callback_with_unknown_state_is_refused(client):
-    response = client.post(CALLBACK_PATH, data={"id_token": make_id_token(), "state": "made-up"})
+    response = client.post(settings.callback_path, data={"id_token": make_id_token(), "state": "made-up"})
     assert response.status_code == 400
     assert "set-cookie" not in response.headers
 
@@ -82,26 +82,26 @@ def test_callback_with_unknown_state_is_refused(client):
 def test_callback_with_invalid_token_is_refused(client):
     state, nonce = start_login(client)
     expired = make_id_token(nonce=nonce, exp=int(time.time()) - 3600)
-    response = client.post(CALLBACK_PATH, data={"id_token": expired, "state": state})
+    response = client.post(settings.callback_path, data={"id_token": expired, "state": state})
     assert response.status_code == 401
     assert "set-cookie" not in response.headers
 
 
 def test_callback_without_a_token_is_refused(client):
     state, _ = start_login(client)
-    assert client.post(CALLBACK_PATH, data={"state": state}).status_code == 400
+    assert client.post(settings.callback_path, data={"state": state}).status_code == 400
 
 
 def test_callback_state_cannot_be_replayed(client):
     state, nonce = start_login(client)
     callback = {"id_token": make_id_token(nonce=nonce), "state": state}
-    assert client.post(CALLBACK_PATH, data=callback).status_code == 303
-    assert client.post(CALLBACK_PATH, data=callback).status_code == 400
+    assert client.post(settings.callback_path, data=callback).status_code == 303
+    assert client.post(settings.callback_path, data=callback).status_code == 400
 
 
 def test_error_from_entra_is_shown(client):
     response = client.post(
-        CALLBACK_PATH, data={"error": "access_denied", "error_description": "user cancelled"}
+        settings.callback_path, data={"error": "access_denied", "error_description": "user cancelled"}
     )
     assert response.status_code == 400
     assert "access_denied" in response.text
@@ -135,7 +135,7 @@ def test_the_session_still_carries_the_token_itself(client, sign_in):
     # No route hands it to a browser any more -- see tests/test_proxy.py -- but the
     # server needs it to identify the visitor to the backend, so it is in the cookie.
     sign_in()
-    session = main.sessions.read(client.cookies[SESSION_COOKIE])
+    session = main.sessions.read(client.cookies[settings.session_cookie])
 
     assert session is not None
     assert unverified_claims(session.id_token).preferred_username == "test.user@example.com"
@@ -154,7 +154,7 @@ def test_logout_ends_the_session(client, sign_in):
 
 
 def test_forged_session_cookie_is_not_accepted(client):
-    client.cookies.set(SESSION_COOKIE, "a-cookie-we-never-issued")
+    client.cookies.set(settings.session_cookie, "a-cookie-we-never-issued")
     assert client.get("/index.html").status_code == 302
 
 

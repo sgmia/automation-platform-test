@@ -11,7 +11,8 @@ CONFIG = "ENTRA_TENANT_ID=from-env-file\nENTRA_CLIENT_ID=client-from-env-file\n"
 def project(tmp_path, monkeypatch):
     """An empty working directory with no ENTRA_* variables in the environment."""
     overridable = (
-        "TENANT_ID", "CLIENT_ID", "BASE_URL", "SESSION_TTL", "COOKIE_SECRET", "BACKEND_CLIENT_SECRET"
+        "TENANT_ID", "CLIENT_ID", "BASE_URL", "SESSION_TTL", "COOKIE_SECRET", "BACKEND_CLIENT_SECRET",
+        "CALLBACK_PATH", "API_PREFIX", "SESSION_COOKIE",
     )
     for name in overridable:
         monkeypatch.delenv(f"ENTRA_{name}", raising=False)
@@ -37,6 +38,51 @@ def test_defaults_apply_to_anything_the_env_file_omits(project):
     assert settings.base_url == "http://localhost:3000"
     assert settings.session_ttl == 8 * 60 * 60
     assert not settings.backend_enabled
+
+
+def test_the_paths_have_defaults_and_are_overridable(project):
+    (project / ".env").write_text(CONFIG)
+    settings = load_settings()
+    assert (settings.callback_path, settings.api_prefix, settings.session_cookie) == (
+        "/oauth2/token", "/api/", "session"
+    )
+
+    (project / ".env.local").write_text(
+        "ENTRA_CALLBACK_PATH=/signin\nENTRA_API_PREFIX=/rpc/\nENTRA_SESSION_COOKIE=sid\n"
+    )
+    settings = load_settings()
+
+    assert settings.callback_path == "/signin"
+    assert settings.redirect_uri == "http://localhost:3000/signin"
+    assert settings.api_prefix == "/rpc/"
+    assert settings.session_cookie == "sid"
+
+
+@pytest.mark.parametrize(
+    "configured, callback, prefix",
+    [("oauth2/token", "/oauth2/token", "/api/"), ("/oauth2/token/", "/oauth2/token", "/api/")],
+)
+def test_the_paths_are_normalised(project, configured, callback, prefix):
+    # The slashes are supplied, so a prefix is always `f"{api_prefix}send"`-able and a
+    # callback path always concatenates onto base_url.
+    (project / ".env").write_text(
+        f"{CONFIG}ENTRA_CALLBACK_PATH={configured}\nENTRA_API_PREFIX=api\n"
+    )
+
+    settings = load_settings()
+
+    assert settings.callback_path == callback
+    assert settings.api_prefix == prefix
+
+
+@pytest.mark.parametrize("name", ["ENTRA_CALLBACK_PATH", "ENTRA_API_PREFIX"])
+def test_a_path_of_the_site_root_is_refused(project, name):
+    # As a prefix "/" covers every request; as a route it shadows the static site.
+    (project / ".env").write_text(f"{CONFIG}{name}=/\n")
+
+    with pytest.raises(ValueError) as caught:
+        load_settings()
+    assert not isinstance(caught.value, SystemExit)  # not a missing field
 
 
 def test_env_local_wins_over_env(project):

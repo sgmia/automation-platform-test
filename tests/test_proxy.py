@@ -11,7 +11,7 @@ import httpx2
 import pytest
 
 from entra_server.backend import targets_backend
-from entra_server.settings import SESSION_COOKIE, settings
+from entra_server.settings import settings
 from tests.conftest import BACKEND_URL
 
 THINGS = f"{BACKEND_URL}/things"
@@ -252,7 +252,7 @@ def test_the_routes_that_handed_out_tokens_are_gone(client, sign_in, backend, pa
 
 def test_the_session_cookie_is_not_passed_on_to_the_backend(client, sign_in, forwarding):
     sign_in()
-    assert client.cookies.get(SESSION_COOKIE)  # the browser is holding one
+    assert client.cookies.get(settings.session_cookie)  # the browser is holding one
     post(client)
 
     # Only what the page asked to be sent is forwarded. The request the browser made

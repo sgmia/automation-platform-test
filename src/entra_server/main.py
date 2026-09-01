@@ -32,16 +32,12 @@ from pydantic import BaseModel
 from .backend import ALLOWED_METHODS, BackendProxy, Forwarded, targets_backend
 from .oidc import ClientCredentials, EntraID, IdTokenClaims, TokenError
 from .sessions import PendingLogins, Session, SessionCookie
-from .settings import CALLBACK_PATH, SESSION_COOKIE, env_files_found, settings
+from .settings import env_files_found, settings
 
 log = logging.getLogger(__name__)
 
 # Browsers drop a cookie of about 4 KB; warn well before one goes silently missing.
 MAX_COOKIE_BYTES = 3500
-
-# Routes the page calls with fetch. A redirect to Entra is no use to a fetch, so
-# these answer 401 instead -- see `start_sign_in`.
-API_PREFIX = "/api/"
 
 entra = EntraID(settings)
 backend_credentials = ClientCredentials(settings, entra)
@@ -130,7 +126,7 @@ def resolve_static_file(path: str) -> Path | None:
 
 async def current_user(
     request: Request,
-    session: Annotated[str | None, Cookie()] = None,
+    session: Annotated[str | None, Cookie(alias=settings.session_cookie)] = None,
 ) -> Session:
     """Dependency for anything that requires a signed-in visitor."""
     signed_in = sessions.read(session)
@@ -150,7 +146,7 @@ CurrentUser = Annotated[Session, Depends(current_user)]
 @app.exception_handler(NotAuthenticated)
 async def start_sign_in(request: Request, error: NotAuthenticated) -> Response:
     """Send visitors without a session to Entra ID to sign in."""
-    if request.url.path.startswith(API_PREFIX):
+    if request.url.path.startswith(settings.api_prefix):
         # `fetch` would follow a 302 to Microsoft and fail on CORS, leaving the page
         # with an error that says nothing. This it can read out and show.
         return JSONResponse(
@@ -171,13 +167,13 @@ async def login(next: str = "/") -> Response:
     raise NotAuthenticated(next_path=next)
 
 
-@app.get(CALLBACK_PATH, include_in_schema=False)
+@app.get(settings.callback_path, include_in_schema=False)
 async def callback_is_post_only() -> Response:
     """Declared so a stray GET does not fall through to the static catch-all."""
     return error_page(405, "Method not allowed", "The callback is delivered by POST.")
 
 
-@app.post(CALLBACK_PATH, include_in_schema=False)
+@app.post(settings.callback_path, include_in_schema=False)
 async def callback(
     id_token: Annotated[str | None, Form()] = None,
     state: Annotated[str | None, Form()] = None,
@@ -216,7 +212,7 @@ async def callback(
 
     response = RedirectResponse(next_path, status_code=303)
     response.set_cookie(
-        SESSION_COOKIE,
+        settings.session_cookie,
         cookie,
         max_age=max_age,
         httponly=True,
@@ -237,7 +233,7 @@ async def logout() -> Response:
     deliberately does without.
     """
     response = RedirectResponse("/", status_code=303)
-    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(settings.session_cookie, path="/")
     return response
 
 
@@ -254,7 +250,7 @@ class BackendInfo(BaseModel):
     url: str
 
 
-@app.get(f"{API_PREFIX}backend")
+@app.get(f"{settings.api_prefix}backend")
 async def backend_info(user: CurrentUser) -> BackendInfo:
     """Where the backend is. Deliberately not a token: the page is given neither.
 
@@ -276,7 +272,7 @@ class SendRequest(BaseModel):
     body: str | None = None
 
 
-@app.post(f"{API_PREFIX}send")
+@app.post(f"{settings.api_prefix}send")
 async def send_to_backend(request: SendRequest, user: CurrentUser) -> Forwarded:
     """Make a request to the backend on behalf of the signed-in visitor.
 
